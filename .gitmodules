@@ -1,3 +1,6 @@
 [submodule "lib"]
 	path = lib
 	url = https://github.com/gabime/spdlog.git
+[submodule "lib2/json"]
+	path = lib2/json
+	url = https://github.com/nlohmann/json.git
