@@ -11,14 +11,6 @@ extern "C" {
 #include <nfp_cpp.h>
 }
 
-struct RegisterSpec {
-    std::string name;
-    uint64_t offset;
-    uint32_t bytes;
-    uint32_t buffer_size;
-    uint32_t reg_island;
-};
-
 typedef struct stored_flow_key
 {
     uint32_t src_ip : 32;
@@ -81,11 +73,53 @@ typedef struct CounterRecord{
 
 class SmartNicReader {
 public:
-    explicit SmartNicReader(nfp_cpp *cpp, uint64_t ememBase);
+    /**
+     * @param cpp       NFP CPP handle
+     * @param semAddr0  Address of _global_semaphores (primary buffer)
+     * @param semAddr1  Address of _global_semaphores_dup (secondary buffer)
+     * @param dataAddr0 Address of __flow_data (primary buffer)
+     * @param dataAddr1 Address of __flow_data_dup (secondary buffer)
+     * @param semIsland Island ID for semaphore registers
+     * @param dataIsland Island ID for flow data registers
+     * @param slotCount Number of slots in the array (BUFFER_SIZE)
+     */
+    SmartNicReader(nfp_cpp *cpp,
+                   uint64_t semAddr0, uint64_t semAddr1,
+                   uint64_t dataAddr0, uint64_t dataAddr1,
+                   uint32_t semIsland, uint32_t dataIsland,
+                   size_t slotCount);
 
-    std::vector<uint8_t> readAndReset(const RegisterSpec &reg) noexcept;
+    /**
+     * Read flow data from SmartNIC using the semaphore-guarded double-buffer protocol:
+     *   1. Read _global_semaphores
+     *   2. Fill _global_semaphores to 4 (lock)
+     *   3. For each slot where semaphore == 3, read the flow_data entry
+     *   4. Fill that flow_data slot to 0
+     *   5. Fill _global_semaphores to 0 (unlock)
+     *   6. Toggle the active buffer
+     *
+     * @return Vector of flow_data entries that had valid data (semaphore == 3)
+     */
+    std::vector<flow_data> readFlowData() noexcept;
 
 private:
     nfp_cpp *cpp_;
-    uint64_t ememBase_;
+
+    // Addresses for double buffers: [0] = primary, [1] = dup
+    uint64_t semAddr_[2];
+    uint64_t dataAddr_[2];
+
+    // CPP IDs for area operations
+    uint32_t semCppId_;
+    uint32_t dataCppId_;
+
+    // Sizes
+    unsigned long semSize_;
+    unsigned long dataSize_;
+
+    // Number of slots
+    size_t slotCount_;
+
+    // Current active buffer index (0 or 1), toggled after each read
+    int bufferState_;
 };

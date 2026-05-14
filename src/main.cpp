@@ -26,9 +26,6 @@
 namespace
 {
 
-    std::vector<RegisterSpec> kRegisters;
-    std::size_t kRegisterCount = 0;
-
     struct ExportData
     {
         std::map<Tuple, FlowRecord> flowMap;
@@ -42,34 +39,6 @@ namespace
         std::queue<ExportData> queue;
     };
 
-    template <typename T>
-    T readValueAt(const std::vector<uint8_t> &buffer, std::size_t offset, std::size_t base = 0)
-    {
-        T value{};
-        if (offset + sizeof(T) > buffer.size())
-        {
-            return value;
-        }
-        std::memcpy(&value, buffer.data() + base + offset, sizeof(T));
-        return value;
-    }
-
-    uint64_t readRegisterValue(const std::vector<uint8_t> &buffer,
-                               const RegisterSpec &reg,
-                               std::size_t index)
-    {
-        const std::size_t offset = index * reg.bytes;
-        switch (reg.bytes)
-        {
-        case 4:
-            return readValueAt<uint32_t>(buffer, offset);
-        case 8:
-            return (static_cast<uint64_t>(readValueAt<uint32_t>(buffer, offset - 4, 0)) << 32) | readValueAt<uint32_t>(buffer, offset, 4);
-        default:
-            return 0;
-        }
-    }
-
     void smartNicIoThread(SmartNicReader &reader,
                           SharedQueue &shared,
                           std::atomic<bool> &running,
@@ -79,68 +48,31 @@ namespace
 
         while (running.load())
         {
-            std::vector<std::vector<uint8_t>> snapshot;
-            snapshot.reserve(kRegisterCount);
+            std::vector<flow_data> flowEntries = reader.readFlowData();
 
-            bool readOk = true;
-            for (const auto &reg : kRegisters)
-            {
-                auto data = reader.readAndReset(reg);
-                if (data.empty())
-                {
-                    readOk = false;
-                    break;
-                }
-                snapshot.push_back(std::move(data));
-            }
-
-            // for (const auto &sn : snapshot)
-            // {
-            //     for (const auto &byte : sn)
-            //     {
-            //         std::cout << std::hex << static_cast<int>(byte) << " ";
-            //     }
-            //     std::cout << "\n";
-            // }
-            // auto now = std::chrono::steady_clock::now();
-            if (readOk && snapshot.size() == kRegisterCount)
+            if (!flowEntries.empty())
             {
                 std::map<Tuple, FlowRecord> localFlowMap;
                 std::map<CounterAgent, CounterRecord> localCounterMap;
 
-                for (std::size_t index = 0; index < BUFFER_SIZE; ++index)
+                for (const auto &entry : flowEntries)
                 {
-                    const uint64_t keyMarker = readRegisterValue(snapshot[0], kRegisters[0], index);
-                    if (keyMarker != 0)
-                    {
-                        Tuple key{};
-                        key.src_ip = static_cast<uint32_t>(keyMarker);
-                        key.dst_ip = static_cast<uint32_t>(readRegisterValue(snapshot[1], kRegisters[1], index));
-                        key.src_port = static_cast<uint16_t>(readRegisterValue(snapshot[2], kRegisters[2], index));
-                        key.dst_port = static_cast<uint16_t>(readRegisterValue(snapshot[3], kRegisters[3], index));
-                        key.protocol = static_cast<uint8_t>(readRegisterValue(snapshot[4], kRegisters[4], index));
+                    Tuple key{};
+                    key.src_ip = entry.key.src_ip;
+                    key.dst_ip = entry.key.dst_ip;
+                    key.src_port = entry.key.src_port;
+                    key.dst_port = entry.key.dst_port;
+                    key.protocol = static_cast<uint8_t>(entry.key.protocol);
 
-                        Agent agent{};
-                        agent.aip = static_cast<uint32_t>(readRegisterValue(snapshot[8], kRegisters[8], index));
-                        agent.in_if = static_cast<uint32_t>(readRegisterValue(snapshot[9], kRegisters[9], index));
-                        agent.out_if = static_cast<uint32_t>(readRegisterValue(snapshot[10], kRegisters[10], index));
-                        agent.frame_length = static_cast<uint64_t>(readRegisterValue(snapshot[5], kRegisters[5], index));
-                        agent.sampling_rate = static_cast<uint32_t>(readRegisterValue(snapshot[6], kRegisters[6], index));
-                        agent.tcp_flag = static_cast<uint8_t>(readRegisterValue(snapshot[7], kRegisters[7], index));
-                        localFlowMap[key].agent.push_back(agent);
-                    }
-                    const uint64_t keyMarker2 = readRegisterValue(snapshot[11], kRegisters[11], index);
-                    if (keyMarker2 != 0)
-                    {
-                        // counter part.
-                        CounterAgent counterAgent{};
-                        counterAgent.agent_ip = static_cast<uint32_t>(readRegisterValue(snapshot[11], kRegisters[11], index));
-                        counterAgent.if_idx = static_cast<uint32_t>(readRegisterValue(snapshot[12], kRegisters[12], index));
-                        CounterRecord &counterRecord = localCounterMap[counterAgent];
-                        counterRecord.if_speed = static_cast<uint32_t>(readRegisterValue(snapshot[13], kRegisters[13], index));
-                        counterRecord.in_octets = static_cast<uint32_t>(readRegisterValue(snapshot[14], kRegisters[14], index));
-                        counterRecord.out_octets = static_cast<uint32_t>(readRegisterValue(snapshot[15], kRegisters[15], index));
-                    }
+                    Agent agent{};
+                    agent.aip = entry.key.agent_ip;
+                    agent.in_if = static_cast<uint32_t>(entry.key.in_if);
+                    agent.out_if = static_cast<uint32_t>(entry.key.out_if);
+                    agent.frame_length = static_cast<uint64_t>(entry.frame_length);
+                    agent.sampling_rate = entry.key.sampling_rate;
+                    agent.tcp_flag = static_cast<uint8_t>(entry.key.tcp_flag);
+
+                    localFlowMap[key].agent.push_back(agent);
                 }
 
                 if (!localFlowMap.empty() || !localCounterMap.empty())
@@ -150,35 +82,7 @@ namespace
                     shared.cv.notify_one();
                 }
             }
-            // std::cout<< "Snapshot taken at " << std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() << " ms\n";
 
-            // for (auto &entry : flowMap)
-            // {
-            //     const Tuple &key = entry.first;
-            //     const FlowRecord &record = entry.second;
-            //     std::cout << "Flow: " << inet_ntoa(*(in_addr *)&key.src_ip) << ":" << key.src_port
-            //               << " -> " << inet_ntoa(*(in_addr *)&key.dst_ip) << ":" << key.dst_port
-            //               << " Proto: " << static_cast<int>(key.protocol)
-            //               << " FrameLen: " << record.frame_length
-            //               << " SampleRate: " << record.sampling_rate
-            //               << " TCPFlag: " << static_cast<int>(record.tcp_flag) << "\n";
-            //     for (const auto &agent : record.agent)
-            //     {
-            //         std::cout << "\tAgent IP: " << inet_ntoa(*(in_addr *)&agent.aip)
-            //                   << " In_if: " << agent.in_if
-            //                   << " Out_if: " << agent.out_if << "\n";
-            //     }
-            // }
-            // for (auto &entry : counterMap)
-            // {
-            //     const CounterAgent &key = entry.first;
-            //     const CounterRecord &record = entry.second;
-            //     std::cout << "Counter: AgentIP: " << inet_ntoa(*(in_addr *)&key.agent_ip)
-            //               << " If_idx: " << key.if_idx
-            //               << " If_speed: " << record.if_speed
-            //               << " In_octets: " << record.in_octets
-            //               << " Out_octets: " << record.out_octets << "\n";
-            // }
             nextTick += period;
             std::this_thread::sleep_until(nextTick);
         }
@@ -279,6 +183,12 @@ int main(int argc, char *argv[])
     uint16_t targetPort = 8080;
     std::unique_ptr<NFPDevice> dev;
 
+    // Symbol names for the 4 registers (configurable via YAML)
+    std::string semSym = "_global_semaphores";
+    std::string semDupSym = "_global_semaphores_dup";
+    std::string flowDataSym = "__flow_data";
+    std::string flowDataDupSym = "__flow_data_dup";
+
     try
     {
         YAML::Node config = YAML::LoadFile(argv[1]);
@@ -291,6 +201,14 @@ int main(int argc, char *argv[])
             targetIp = config["targetIp"].as<std::string>();
         if (config["targetPort"])
             targetPort = config["targetPort"].as<uint16_t>();
+        if (config["semaphore_sym"])
+            semSym = config["semaphore_sym"].as<std::string>();
+        if (config["semaphore_dup_sym"])
+            semDupSym = config["semaphore_dup_sym"].as<std::string>();
+        if (config["flow_data_sym"])
+            flowDataSym = config["flow_data_sym"].as<std::string>();
+        if (config["flow_data_dup_sym"])
+            flowDataDupSym = config["flow_data_dup_sym"].as<std::string>();
 
         try
         {
@@ -301,26 +219,6 @@ int main(int argc, char *argv[])
             std::cerr << "Fatal: " << ex.what() << '\n';
             return 1;
         }
-
-        if (config["kRegisters"])
-        {
-            for (const auto &reg : config["kRegisters"])
-            {
-                RegisterSpec spec;
-                const nfp_rtsym *rtsym = dev->getSymbolData(reg["name"].as<std::string>().c_str());
-                if (!rtsym)
-                {
-                    std::cerr << "Symbol not found: " << reg["name"].as<std::string>() << "\n";
-                    continue;
-                }
-                spec.name = rtsym->name;
-                spec.offset = rtsym->addr;
-                spec.bytes = (rtsym->size)/BUFFER_SIZE;
-                spec.buffer_size = BUFFER_SIZE;
-                spec.reg_island = rtsym->domain;
-                kRegisters.push_back(spec);
-            }
-        }
     }
     catch (const YAML::Exception &e)
     {
@@ -328,9 +226,27 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    kRegisterCount = kRegisters.size();
+    // Look up the 4 rtsym symbols
+    const nfp_rtsym *symSem = dev->getSymbolData(semSym.c_str());
+    const nfp_rtsym *symSemDup = dev->getSymbolData(semDupSym.c_str());
+    const nfp_rtsym *symData = dev->getSymbolData(flowDataSym.c_str());
+    const nfp_rtsym *symDataDup = dev->getSymbolData(flowDataDupSym.c_str());
 
-    SmartNicReader reader(dev->cpp(), 0);
+    if (!symSem || !symSemDup || !symData || !symDataDup) {
+        std::cerr << "Fatal: one or more required symbols not found on SmartNIC\n";
+        if (!symSem)      std::cerr << "  missing: " << semSym << "\n";
+        if (!symSemDup)   std::cerr << "  missing: " << semDupSym << "\n";
+        if (!symData)     std::cerr << "  missing: " << flowDataSym << "\n";
+        if (!symDataDup)  std::cerr << "  missing: " << flowDataDupSym << "\n";
+        return 1;
+    }
+
+    SmartNicReader reader(dev->cpp(),
+                          symSem->addr, symSemDup->addr,
+                          symData->addr, symDataDup->addr,
+                          symSem->domain, symData->domain,
+                          BUFFER_SIZE);
+
     SharedQueue shared;
     std::atomic<bool> running{true};
 
