@@ -17,6 +17,9 @@ constexpr uint32_t kCppActionWrite = 32;
 constexpr uint32_t kResetFillValue = 0;
 }  // namespace
 
+
+
+
 SmartNicReader::SmartNicReader(nfp_cpp *cpp, uint64_t ememBase)
     : cpp_(cpp), ememBase_(ememBase) {}
 
@@ -53,7 +56,7 @@ std::vector<uint8_t> SmartNicReader::readAndReset(const RegisterSpec &reg) noexc
         nfp_cpp_area_release_free(readArea);
         return {};
     }
-    std::cout<< "Read " << bytesRead << " bytes from register " << reg.name << "\n";
+    // std::cout<< "Read " << bytesRead << " bytes from register " << reg.name << "\n";
     const int fillResult = nfp_cpp_area_fill(readArea, 0, kResetFillValue, totalBytes);
     nfp_cpp_area_release_free(readArea);
     // if (fillResult < 0) {

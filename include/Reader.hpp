@@ -19,6 +19,26 @@ struct RegisterSpec {
     uint32_t reg_island;
 };
 
+typedef struct stored_flow_key
+{
+    uint32_t src_ip : 32;
+    uint32_t dst_ip : 32;
+    uint32_t sampling_rate : 32;
+    uint32_t agent_ip : 32;
+    uint16_t in_if : 16;
+    uint16_t out_if : 16;
+    uint16_t src_port : 16;
+    uint16_t dst_port : 16;
+    uint16_t protocol : 16;
+    uint16_t tcp_flag : 16;
+};
+
+typedef struct flow_data
+{
+    struct stored_flow_key key;
+    uint32_t frame_length : 32;
+};
+
 typedef struct Tuple{
     uint32_t src_ip;
     uint32_t dst_ip;
@@ -36,13 +56,13 @@ typedef struct Agent{
     uint32_t aip;
     uint32_t in_if;
     uint32_t out_if;
+    uint64_t frame_length;
+    uint32_t sampling_rate;
+    uint8_t tcp_flag;
 } Agent;
 
 typedef struct FlowRecord{
     std::vector<Agent> agent;
-    uint64_t frame_length;
-    uint32_t sampling_rate;
-    uint8_t tcp_flag;
 } FlowRecord;
 
 typedef struct CounterAgent{

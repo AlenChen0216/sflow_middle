@@ -1,4 +1,21 @@
-registers:
-  - "_pif_register_"
-  - "_pif_register__"
-  - "_pif_register__"
+devnum: 0
+runSecs: 30
+targetIp: "127.0.0.1"
+targetPort: 8080
+kRegisters:
+  - name: "_pif_register_reg_src_ip"
+  - name: "_pif_register_reg_dst_ip"
+  - name: "_pif_register_reg_src_port"
+  - name: "_pif_register_reg_dst_port"
+  - name: "_pif_register_reg_protocol"
+  - name: "__frame_length"
+  - name: "_pif_register_reg_sampling_rate"
+  - name: "_pif_register_reg_tcp_flag"
+  - name: "_pif_register_reg_agent_ip"
+  - name: "_pif_register_reg_in_if"
+  - name: "_pif_register_reg_out_if"
+  - name: "_pif_register_reg_agent_ip"
+  - name: "_pif_register_reg_if_idx"
+  - name: "_pif_register_reg_if_speed"
+  - name: "_pif_register_reg_in_octets"
+  - name: "_pif_register_reg_out_octets"

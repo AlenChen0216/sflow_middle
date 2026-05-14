@@ -54,3 +54,12 @@ set_target_properties(${EXEC_NAME} PROPERTIES
 	INSTALL_RPATH "${NETRONOME_ROOT}/lib"
 )
 target_compile_options(${EXEC_NAME} PRIVATE -Wall -Wextra -fdiagnostics-color=always -O3)
+
+add_executable(test test/main.cpp)
+target_include_directories(test PRIVATE "${NETRONOME_INCLUDE_DIR}")
+target_link_libraries(test PRIVATE ${NETRONOME_LIBS})
+set_target_properties(test PROPERTIES
+	BUILD_RPATH "${NETRONOME_ROOT}/lib"
+	INSTALL_RPATH "${NETRONOME_ROOT}/lib"
+)
+target_compile_options(test PRIVATE -Wall -Wextra -fdiagnostics-color=always -O3)

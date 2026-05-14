@@ -16,37 +16,18 @@
 #include <sys/socket.h>
 #include <queue>
 #include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include "../include/Device.hpp"
 #include "../include/Reader.hpp"
 
-#define BUFFER_SIZE 30
+#define BUFFER_SIZE 10
 
 namespace
 {
 
-    static const RegisterSpec kRegisters[] = { // Notice: NIC will treat 16 bit as 32 bit.
-        // flow sample
-        {"_pif_register_reg_src_ip", 0x0000400500ULL, 4, BUFFER_SIZE, 25},
-        {"_pif_register_reg_dst_ip", 0x0000808700ULL, 4, BUFFER_SIZE, 24},
-        {"_pif_register_reg_src_port", 0x0000400400ULL, 4, BUFFER_SIZE, 25},
-        {"_pif_register_reg_dst_port", 0x0000808600ULL, 4, BUFFER_SIZE, 24},
-        {"_pif_register_reg_protocol", 0x0000400300ULL, 4, BUFFER_SIZE, 25},
-        {"_pif_register_reg_frame_length", 0x0000808300ULL, 4, BUFFER_SIZE, 24},
-        {"_pif_register_reg_sample_rate", 0x0000808500ULL, 4, BUFFER_SIZE, 24},
-        {"_pif_register_reg_tcp_flag", 0x000080a000ULL, 4, BUFFER_SIZE, 24},
-        {"_pif_register_reg_agent_ip", 0x0000400200ULL, 4, BUFFER_SIZE, 25},
-        {"_pif_register_reg_in_if", 0x0000808400ULL, 4, BUFFER_SIZE, 24},
-        {"_pif_register_reg_out_if", 0x0000400100ULL, 4, BUFFER_SIZE, 25},
-
-        // counter sample
-        {"_pif_register_reg_agent_ip", 0x0000400800ULL, 4, BUFFER_SIZE, 25},
-        {"_pif_register_reg_if_idx", 0x000080a200ULL, 4, BUFFER_SIZE, 24},
-        {"_pif_register_reg_if_speed", 0x0000400600ULL, 4, BUFFER_SIZE, 25},
-        {"_pif_register_reg_in_octets", 0x0000400700ULL, 4, BUFFER_SIZE, 25},
-        {"_pif_register_reg_out_octets", 0x000080a100ULL, 4, BUFFER_SIZE, 24}};
-
-    constexpr std::size_t kRegisterCount = sizeof(kRegisters) / sizeof(kRegisters[0]);
+    std::vector<RegisterSpec> kRegisters;
+    std::size_t kRegisterCount = 0;
 
     struct ExportData
     {
@@ -70,7 +51,6 @@ namespace
             return value;
         }
         std::memcpy(&value, buffer.data() + base + offset, sizeof(T));
-        std::cout << value << "\n";
         return value;
     }
 
@@ -140,16 +120,14 @@ namespace
                         key.dst_port = static_cast<uint16_t>(readRegisterValue(snapshot[3], kRegisters[3], index));
                         key.protocol = static_cast<uint8_t>(readRegisterValue(snapshot[4], kRegisters[4], index));
 
-                        FlowRecord &record = localFlowMap[key];
-                        record.frame_length = static_cast<uint32_t>(readRegisterValue(snapshot[5], kRegisters[5], index));
-                        record.sampling_rate = static_cast<uint32_t>(readRegisterValue(snapshot[6], kRegisters[6], index));
-                        record.tcp_flag = static_cast<uint8_t>(readRegisterValue(snapshot[7], kRegisters[7], index));
-
                         Agent agent{};
                         agent.aip = static_cast<uint32_t>(readRegisterValue(snapshot[8], kRegisters[8], index));
                         agent.in_if = static_cast<uint32_t>(readRegisterValue(snapshot[9], kRegisters[9], index));
                         agent.out_if = static_cast<uint32_t>(readRegisterValue(snapshot[10], kRegisters[10], index));
-                        record.agent.push_back(agent);
+                        agent.frame_length = static_cast<uint64_t>(readRegisterValue(snapshot[5], kRegisters[5], index));
+                        agent.sampling_rate = static_cast<uint32_t>(readRegisterValue(snapshot[6], kRegisters[6], index));
+                        agent.tcp_flag = static_cast<uint8_t>(readRegisterValue(snapshot[7], kRegisters[7], index));
+                        localFlowMap[key].agent.push_back(agent);
                     }
                     const uint64_t keyMarker2 = readRegisterValue(snapshot[11], kRegisters[11], index);
                     if (keyMarker2 != 0)
@@ -165,7 +143,8 @@ namespace
                     }
                 }
 
-                if (!localFlowMap.empty() || !localCounterMap.empty()) {
+                if (!localFlowMap.empty() || !localCounterMap.empty())
+                {
                     std::lock_guard<std::mutex> lock(shared.mtx);
                     shared.queue.push({std::move(localFlowMap), std::move(localCounterMap)});
                     shared.cv.notify_one();
@@ -202,14 +181,15 @@ namespace
             // }
             nextTick += period;
             std::this_thread::sleep_until(nextTick);
-            
         }
     }
 
     void transmitThread(SharedQueue &shared, std::atomic<bool> &running,
-                        const std::string& target_ip, uint16_t target_port) {
+                        const std::string &target_ip, uint16_t target_port)
+    {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) {
+        if (sock < 0)
+        {
             std::cerr << "Failed to create socket.\n";
             return;
         }
@@ -217,18 +197,22 @@ namespace
         struct sockaddr_in dest_addr{};
         dest_addr.sin_family = AF_INET;
         dest_addr.sin_port = htons(target_port);
-        if (inet_pton(AF_INET, target_ip.c_str(), &dest_addr.sin_addr) <= 0) {
+        if (inet_pton(AF_INET, target_ip.c_str(), &dest_addr.sin_addr) <= 0)
+        {
             std::cerr << "Invalid address.\n";
             close(sock);
             return;
         }
 
-        while (running.load()) {
+        while (running.load())
+        {
             ExportData data;
             {
                 std::unique_lock<std::mutex> lock(shared.mtx);
-                shared.cv.wait(lock, [&]{ return !shared.queue.empty() || !running.load(); });
-                if (!running.load() && shared.queue.empty()) {
+                shared.cv.wait(lock, [&]
+                               { return !shared.queue.empty() || !running.load(); });
+                if (!running.load() && shared.queue.empty())
+                {
                     break;
                 }
                 data = std::move(shared.queue.front());
@@ -237,24 +221,24 @@ namespace
 
             nlohmann::json j;
             nlohmann::json flowArray = nlohmann::json::array();
-            for (const auto& [key, record] : data.flowMap) {
+            for (const auto &[key, record] : data.flowMap)
+            {
                 nlohmann::json item;
                 item["src_ip"] = key.src_ip;
                 item["dst_ip"] = key.dst_ip;
                 item["src_port"] = key.src_port;
                 item["dst_port"] = key.dst_port;
                 item["protocol"] = key.protocol;
-                item["frame_length"] = record.frame_length;
-                item["sampling_rate"] = record.sampling_rate;
-                item["tcp_flag"] = record.tcp_flag;
 
                 nlohmann::json agents = nlohmann::json::array();
-                for (const auto& ag : record.agent) {
-                    agents.push_back({
-                        {"aip", ag.aip},
-                        {"in_if", ag.in_if},
-                        {"out_if", ag.out_if}
-                    });
+                for (const auto &ag : record.agent)
+                {
+                    agents.push_back({{"aip", ag.aip},
+                                      {"in_if", ag.in_if},
+                                      {"out_if", ag.out_if},
+                                      {"frame_length", ag.frame_length},
+                                      {"sampling_rate", ag.sampling_rate},
+                                      {"tcp_flag", ag.tcp_flag}});
                 }
                 item["agent"] = agents;
                 flowArray.push_back(item);
@@ -262,7 +246,8 @@ namespace
             j["flowMap"] = flowArray;
 
             nlohmann::json counterArray = nlohmann::json::array();
-            for (const auto& [key, record] : data.counterMap) {
+            for (const auto &[key, record] : data.counterMap)
+            {
                 nlohmann::json item;
                 item["agent_ip"] = key.agent_ip;
                 item["if_idx"] = key.if_idx;
@@ -272,11 +257,15 @@ namespace
                 counterArray.push_back(item);
             }
             j["counterMap"] = counterArray;
-
+            if (j["flowMap"].empty() && j["counterMap"].empty())
+            {
+                std::cout << "No data to send.\n";
+                continue;
+            }
             std::string payload = j.dump();
-            std::cout<<"sending data: " << payload << "\n";
+            std::cout << "sending data: " << payload << "\n";
             sendto(sock, payload.data(), payload.size(), 0,
-                   reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr));
+                   reinterpret_cast<struct sockaddr *>(&dest_addr), sizeof(dest_addr));
         }
         close(sock);
     }
@@ -288,34 +277,58 @@ int main(int argc, char *argv[])
     int runSecs = 30;
     std::string targetIp = "127.0.0.1";
     uint16_t targetPort = 8080;
-
-    if (argc > 1)
-    {
-        devnum = static_cast<unsigned int>(std::atoi(argv[1]));
-    }
-    if (argc > 2)
-    {
-        runSecs = std::atoi(argv[2]);
-    }
-    if (argc > 3)
-    {
-        targetIp = argv[3];
-    }
-    if (argc > 4)
-    {
-        targetPort = static_cast<uint16_t>(std::atoi(argv[4]));
-    }
-
     std::unique_ptr<NFPDevice> dev;
+
     try
     {
-        dev = std::make_unique<NFPDevice>(devnum);
+        YAML::Node config = YAML::LoadFile(argv[1]);
+
+        if (config["devnum"])
+            devnum = config["devnum"].as<unsigned int>();
+        if (config["runSecs"])
+            runSecs = config["runSecs"].as<int>();
+        if (config["targetIp"])
+            targetIp = config["targetIp"].as<std::string>();
+        if (config["targetPort"])
+            targetPort = config["targetPort"].as<uint16_t>();
+
+        try
+        {
+            dev = std::make_unique<NFPDevice>(devnum);
+        }
+        catch (const std::exception &ex)
+        {
+            std::cerr << "Fatal: " << ex.what() << '\n';
+            return 1;
+        }
+
+        if (config["kRegisters"])
+        {
+            for (const auto &reg : config["kRegisters"])
+            {
+                RegisterSpec spec;
+                const nfp_rtsym *rtsym = dev->getSymbolData(reg["name"].as<std::string>().c_str());
+                if (!rtsym)
+                {
+                    std::cerr << "Symbol not found: " << reg["name"].as<std::string>() << "\n";
+                    continue;
+                }
+                spec.name = rtsym->name;
+                spec.offset = rtsym->addr;
+                spec.bytes = (rtsym->size)/BUFFER_SIZE;
+                spec.buffer_size = BUFFER_SIZE;
+                spec.reg_island = rtsym->domain;
+                kRegisters.push_back(spec);
+            }
+        }
     }
-    catch (const std::exception &ex)
+    catch (const YAML::Exception &e)
     {
-        std::cerr << "Fatal: " << ex.what() << '\n';
+        std::cerr << "YAML parsing error or setting.yaml not found: " << e.what() << "\n";
         return 1;
     }
+
+    kRegisterCount = kRegisters.size();
 
     SmartNicReader reader(dev->cpp(), 0);
     SharedQueue shared;
@@ -342,7 +355,8 @@ int main(int argc, char *argv[])
     {
         nicThread.join();
     }
-    if (txThread.joinable()) {
+    if (txThread.joinable())
+    {
         txThread.join();
     }
 
