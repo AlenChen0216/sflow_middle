@@ -14,20 +14,25 @@
 #include <vector>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <unistd.h>
 #include <queue>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 
 #include "../include/Device.hpp"
 #include "../include/Reader.hpp"
+#include "../include/CounterReader.hpp"
 
-#define BUFFER_SIZE 10
+#define BUFFER_SIZE 20000
+#define BUFFER_SIZE2 1024
 
 namespace
 {
 
     struct ExportData
     {
+        double execution_time; // Time taken to read and process data from SmartNIC
         std::map<Tuple, FlowRecord> flowMap;
         std::map<CounterAgent, CounterRecord> counterMap;
     };
@@ -39,21 +44,59 @@ namespace
         std::queue<ExportData> queue;
     };
 
+    int64_t toAdjustedMilliseconds(mac_time_data ts, int64_t offsetTimeMs)
+    {
+        return static_cast<int64_t>(ts.sec) * 1000 +
+               static_cast<int64_t>(ts.nsec) / 1000000 +
+               offsetTimeMs;
+    }
+
     void smartNicIoThread(SmartNicReader &reader,
+                          CounterReader &counterReader,
                           SharedQueue &shared,
                           std::atomic<bool> &running,
-                          std::chrono::milliseconds period)
+                          std::chrono::milliseconds period,
+                          int64_t offsetTimeMs)
     {
         auto nextTick = std::chrono::steady_clock::now();
 
         while (running.load())
         {
+            nextTick += period;
+            std::this_thread::sleep_until(nextTick);
+            // measure time taken by readFlowData() for debugging
+            auto start = std::chrono::steady_clock::now();
+
             std::vector<flow_data> flowEntries = reader.readFlowData();
+            std::vector<counter_data> counterEntries = counterReader.readCounterData();
+
+            auto end = std::chrono::steady_clock::now();
+            std::chrono::duration<double> elapsed = end - start;
+            std::cout << "readFlowData() took " << elapsed.count() << " seconds and returned " << flowEntries.size() << " entries\n";
+            
+            for(auto &f : flowEntries){
+                std::cout << "Read flow entry: src_ip=" << f.key.src_ip
+                          << ", dst_ip=" << f.key.dst_ip
+                          << ", src_port=" << f.key.src_port
+                          << ", dst_port=" << f.key.dst_port
+                          << ", protocol=" << f.key.protocol
+                          << ", agent_ip=" << f.key.agent_ip
+                          << ", in_if=" << f.key.in_if
+                          << ", out_if=" << f.key.out_if
+                          << ", byte_cnt=" << f.data.byte_cnt
+                          << ", packet_cnt=" << f.data.packet_cnt
+                          << ", start_time=" << toAdjustedMilliseconds(f.data.start_time, offsetTimeMs)
+                          << ", end_time=" << toAdjustedMilliseconds(f.data.end_time, offsetTimeMs)
+                          << ", sampling_rate=" << f.key.sampling_rate
+                          << ", tcp_flag=" << f.key.tcp_flag
+                          << std::endl;
+            }
+
+            std::map<Tuple, FlowRecord> localFlowMap;
+            std::map<CounterAgent, CounterRecord> localCounterMap;
 
             if (!flowEntries.empty())
             {
-                std::map<Tuple, FlowRecord> localFlowMap;
-                std::map<CounterAgent, CounterRecord> localCounterMap;
 
                 for (const auto &entry : flowEntries)
                 {
@@ -68,23 +111,43 @@ namespace
                     agent.aip = entry.key.agent_ip;
                     agent.in_if = static_cast<uint32_t>(entry.key.in_if);
                     agent.out_if = static_cast<uint32_t>(entry.key.out_if);
-                    agent.frame_length = static_cast<uint64_t>(entry.frame_length);
+                    agent.byte_cnt = entry.data.byte_cnt;
+                    agent.packet_cnt = entry.data.packet_cnt;
+                    agent.start_time = toAdjustedMilliseconds(entry.data.start_time, offsetTimeMs);
+                    agent.end_time = toAdjustedMilliseconds(entry.data.end_time, offsetTimeMs);
                     agent.sampling_rate = entry.key.sampling_rate;
                     agent.tcp_flag = static_cast<uint8_t>(entry.key.tcp_flag);
-
+                    agent.index = entry.index;
+                    
                     localFlowMap[key].agent.push_back(agent);
                 }
 
-                if (!localFlowMap.empty() || !localCounterMap.empty())
+                
+            }
+            if(!counterEntries.empty())
+            {
+                for(const auto &entry : counterEntries)
                 {
-                    std::lock_guard<std::mutex> lock(shared.mtx);
-                    shared.queue.push({std::move(localFlowMap), std::move(localCounterMap)});
-                    shared.cv.notify_one();
+                    CounterAgent key{};
+                    key.agent_ip = entry.data.key.agent_ip;
+                    key.if_idx = entry.data.key.if_idx;
+
+                    CounterRecord record{};
+                    record.if_speed = entry.data.if_speed;
+                    record.in_octets = entry.data.in_octets;
+                    record.out_octets = entry.data.out_octets;
+
+                    localCounterMap[key] = record;
                 }
             }
 
-            nextTick += period;
-            std::this_thread::sleep_until(nextTick);
+            if (!localFlowMap.empty() || !localCounterMap.empty())
+            {
+                std::lock_guard<std::mutex> lock(shared.mtx);
+                shared.queue.push({elapsed.count(), std::move(localFlowMap), std::move(localCounterMap)});
+                shared.cv.notify_one();
+            }
+            
         }
     }
 
@@ -97,7 +160,13 @@ namespace
             std::cerr << "Failed to create socket.\n";
             return;
         }
-
+        std::fstream testFile;
+        testFile.open("test_output.json", std::ios::out);
+        if( !testFile.is_open() ) {
+            std::cerr << "Failed to open test_output.json for writing.\n";
+            close(sock);
+            return;
+        }
         struct sockaddr_in dest_addr{};
         dest_addr.sin_family = AF_INET;
         dest_addr.sin_port = htons(target_port);
@@ -107,7 +176,7 @@ namespace
             close(sock);
             return;
         }
-
+        
         while (running.load())
         {
             ExportData data;
@@ -140,9 +209,13 @@ namespace
                     agents.push_back({{"aip", ag.aip},
                                       {"in_if", ag.in_if},
                                       {"out_if", ag.out_if},
-                                      {"frame_length", ag.frame_length},
+                                      {"byte_cnt", ag.byte_cnt},
+                                      {"packet_cnt", ag.packet_cnt},
+                                      {"start_time", ag.start_time},
+                                      {"end_time", ag.end_time},
                                       {"sampling_rate", ag.sampling_rate},
-                                      {"tcp_flag", ag.tcp_flag}});
+                                      {"tcp_flag", ag.tcp_flag},
+                                      {"index", ag.index}});
                 }
                 item["agent"] = agents;
                 flowArray.push_back(item);
@@ -160,6 +233,7 @@ namespace
                 item["out_octets"] = record.out_octets;
                 counterArray.push_back(item);
             }
+            j["execution_time"] = data.execution_time;
             j["counterMap"] = counterArray;
             if (j["flowMap"].empty() && j["counterMap"].empty())
             {
@@ -167,31 +241,38 @@ namespace
                 continue;
             }
             std::string payload = j.dump();
-            std::cout << "sending data: " << payload << "\n";
+            // std::cout << "sending data: " << payload << "\n";
+            testFile << payload << std::endl;
             sendto(sock, payload.data(), payload.size(), 0,
                    reinterpret_cast<struct sockaddr *>(&dest_addr), sizeof(dest_addr));
         }
         close(sock);
+        testFile.close();
     }
 } // namespace
 
 int main(int argc, char *argv[])
 {
     unsigned int devnum = 0;
-    int runSecs = 30;
-    std::string targetIp = "127.0.0.1";
-    uint16_t targetPort = 8080;
+    int runSecs = 14;
+    std::string targetIp = "192.168.1.4";
+    uint16_t targetPort = 6343;
     std::unique_ptr<NFPDevice> dev;
 
     // Symbol names for the 4 registers (configurable via YAML)
     std::string semSym = "_global_semaphores";
     std::string semDupSym = "_global_semaphores_dup";
+    std::string flowKeySym = "__flow_key";
+    std::string flowKeyDupSym = "__flow_key_dup";
     std::string flowDataSym = "__flow_data";
     std::string flowDataDupSym = "__flow_data_dup";
+    std::string counterSemSym = "_cglobal_semaphores";
+    std::string counterDataSym = "__counter_data";
+    int64_t offsetTimeMs = 0;
 
     try
     {
-        YAML::Node config = YAML::LoadFile(argv[1]);
+        YAML::Node config = argc > 1 ? YAML::LoadFile(argv[1]) : YAML::LoadFile("setting.yaml");
 
         if (config["devnum"])
             devnum = config["devnum"].as<unsigned int>();
@@ -205,56 +286,93 @@ int main(int argc, char *argv[])
             semSym = config["semaphore_sym"].as<std::string>();
         if (config["semaphore_dup_sym"])
             semDupSym = config["semaphore_dup_sym"].as<std::string>();
+        if (config["flow_key_sym"])
+            flowKeySym = config["flow_key_sym"].as<std::string>();
+        if (config["flow_key_dup_sym"])
+            flowKeyDupSym = config["flow_key_dup_sym"].as<std::string>();
         if (config["flow_data_sym"])
             flowDataSym = config["flow_data_sym"].as<std::string>();
         if (config["flow_data_dup_sym"])
             flowDataDupSym = config["flow_data_dup_sym"].as<std::string>();
-
-        try
-        {
-            dev = std::make_unique<NFPDevice>(devnum);
-        }
-        catch (const std::exception &ex)
-        {
-            std::cerr << "Fatal: " << ex.what() << '\n';
-            return 1;
-        }
+        if (config["counter_semaphore_sym"])
+            counterSemSym = config["counter_semaphore_sym"].as<std::string>();
+        if (config["counter_data_sym"])
+            counterDataSym = config["counter_data_sym"].as<std::string>();
+        if (config["offset_time"])
+            offsetTimeMs = config["offset_time"].as<int64_t>();
     }
     catch (const YAML::Exception &e)
     {
         std::cerr << "YAML parsing error or setting.yaml not found: " << e.what() << "\n";
+        // return 1;
+    }
+    try
+    {
+        dev = std::make_unique<NFPDevice>(devnum);
+    }
+    catch (const std::exception &ex)
+    {
+        std::cerr << "Fatal: " << ex.what() << '\n';
         return 1;
     }
-
     // Look up the 4 rtsym symbols
     const nfp_rtsym *symSem = dev->getSymbolData(semSym.c_str());
     const nfp_rtsym *symSemDup = dev->getSymbolData(semDupSym.c_str());
+    const nfp_rtsym *symKey = dev->getSymbolData(flowKeySym.c_str());
+    const nfp_rtsym *symKeyDup = dev->getSymbolData(flowKeyDupSym.c_str());
     const nfp_rtsym *symData = dev->getSymbolData(flowDataSym.c_str());
     const nfp_rtsym *symDataDup = dev->getSymbolData(flowDataDupSym.c_str());
+    const nfp_rtsym *symCounterSem = dev->getSymbolData(counterSemSym.c_str());
+    const nfp_rtsym *symCounterData = dev->getSymbolData(counterDataSym.c_str());
 
-    if (!symSem || !symSemDup || !symData || !symDataDup) {
+    if (!symSem || !symSemDup || !symKey || !symKeyDup || !symData || !symDataDup || !symCounterSem || !symCounterData) {
         std::cerr << "Fatal: one or more required symbols not found on SmartNIC\n";
         if (!symSem)      std::cerr << "  missing: " << semSym << "\n";
         if (!symSemDup)   std::cerr << "  missing: " << semDupSym << "\n";
+        if (!symKey)      std::cerr << "  missing: " << flowKeySym << "\n";
+        if (!symKeyDup)   std::cerr << "  missing: " << flowKeyDupSym << "\n";
         if (!symData)     std::cerr << "  missing: " << flowDataSym << "\n";
         if (!symDataDup)  std::cerr << "  missing: " << flowDataDupSym << "\n";
+        if (!symCounterSem) std::cerr << "  missing: " << counterSemSym << "\n";
+        if (!symCounterData) std::cerr << "  missing: " << counterDataSym << "\n";
         return 1;
     }
+    std::cout<< "Successfully found all required symbols on SmartNIC\n";
+    std::cout<< ""  << "  " << semSym << ": addr=0x" << std::hex << symSem->addr << std::dec << ", domain=" << symSem->domain << "\n";
+    std::cout<< ""  << "  " << semDupSym << ": addr=0x" << std::hex << symSemDup->addr << std::dec << ", domain=" << symSemDup->domain << "\n";
+    std::cout<< ""  << "  " << flowKeySym << ": addr=0x" << std::hex << symKey->addr << std::dec << ", domain=" << symKey->domain << "\n";
+    std::cout<< ""  << "  " << flowKeyDupSym << ": addr=0x" << std::hex << symKeyDup->addr << std::dec << ", domain=" << symKeyDup->domain << "\n";
+    std::cout<< ""  << "  " << flowDataSym << ": addr=0x" << std::hex << symData->addr << std::dec << ", domain=" << symData->domain << "\n";
+    std::cout<< ""  << "  " << flowDataDupSym << ": addr=0x" << std::hex << symDataDup->addr << std::dec << ", domain=" << symDataDup->domain << "\n";
+    std::cout<< ""  << "  " << counterSemSym << ": addr=0x" << std::hex << symCounterSem->addr << std::dec << ", domain=" << symCounterSem->domain << "\n";
+    std::cout<< ""  << "  " << counterDataSym << ": addr=0x" << std::hex << symCounterData->addr << std::dec << ", domain=" << symCounterData->domain << "\n";
+    std::cout<< ""  << "  offset_time: " << offsetTimeMs << " ms\n";
 
     SmartNicReader reader(dev->cpp(),
                           symSem->addr, symSemDup->addr,
+                          symKey->addr, symKeyDup->addr,
                           symData->addr, symDataDup->addr,
-                          symSem->domain, symData->domain,
+                          symSem->domain, symKey->domain, symData->domain,
+                          symSemDup->domain, symKeyDup->domain, symDataDup->domain,
                           BUFFER_SIZE);
+
+    CounterReader counterReader(dev->cpp(),
+                                symCounterSem->addr,
+                                symCounterData->addr,
+                                symCounterSem->domain,
+                                symCounterData->domain,
+                                BUFFER_SIZE2);
 
     SharedQueue shared;
     std::atomic<bool> running{true};
 
     std::thread nicThread(smartNicIoThread,
                           std::ref(reader),
+                          std::ref(counterReader),
                           std::ref(shared),
                           std::ref(running),
-                          std::chrono::seconds(1));
+                          std::chrono::seconds(1),
+                          offsetTimeMs);
 
     std::thread txThread(transmitThread,
                          std::ref(shared),

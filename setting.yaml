@@ -1,8 +1,13 @@
 devnum: 0
-runSecs: 30
-targetIp: "127.0.0.1"
-targetPort: 8080
+runSecs: 14
+targetIp: "192.168.1.4"
+targetPort: 6343
 semaphore_sym: "_global_semaphores"
 semaphore_dup_sym: "_global_semaphores_dup"
+flow_key_sym: "__flow_key"
+flow_key_dup_sym: "__flow_key_dup"
 flow_data_sym: "__flow_data"
 flow_data_dup_sym: "__flow_data_dup"
+counter_semaphore_sym: "_cglobal_semaphores"
+counter_data_sym: "__counter_data"
+offset_time: 0 # milliseconds added to SmartNIC timestamps before export

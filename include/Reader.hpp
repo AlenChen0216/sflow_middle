@@ -11,24 +11,39 @@ extern "C" {
 #include <nfp_cpp.h>
 }
 
-typedef struct stored_flow_key
+struct stored_flow_key
 {
-    uint32_t src_ip : 32;
-    uint32_t dst_ip : 32;
-    uint32_t sampling_rate : 32;
-    uint32_t agent_ip : 32;
-    uint16_t in_if : 16;
-    uint16_t out_if : 16;
-    uint16_t src_port : 16;
-    uint16_t dst_port : 16;
-    uint16_t protocol : 16;
-    uint16_t tcp_flag : 16;
+    uint32_t src_ip;
+    uint32_t dst_ip;
+    uint32_t sampling_rate;
+    uint32_t agent_ip;
+    uint16_t in_if;
+    uint16_t out_if;
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t protocol;
+    uint16_t tcp_flag;
 };
 
-typedef struct flow_data
+struct mac_time_data
+{
+    uint32_t sec;
+    uint32_t nsec;
+};
+
+struct stored_flow_data
+{
+    uint32_t byte_cnt;
+    uint32_t packet_cnt;
+    struct mac_time_data start_time;
+    struct mac_time_data end_time;
+};
+
+struct flow_data
 {
     struct stored_flow_key key;
-    uint32_t frame_length : 32;
+    struct stored_flow_data data;
+    uint32_t index;
 };
 
 typedef struct Tuple{
@@ -48,28 +63,18 @@ typedef struct Agent{
     uint32_t aip;
     uint32_t in_if;
     uint32_t out_if;
-    uint64_t frame_length;
+    uint32_t byte_cnt;
+    uint32_t packet_cnt;
+    int64_t start_time;
+    int64_t end_time;
     uint32_t sampling_rate;
     uint8_t tcp_flag;
+    uint32_t index; // Store the slot index for later clearing
 } Agent;
 
 typedef struct FlowRecord{
     std::vector<Agent> agent;
 } FlowRecord;
-
-typedef struct CounterAgent{
-    uint32_t agent_ip;
-    uint32_t if_idx;
-    bool operator<(const CounterAgent& agent) const{
-        return std::tie(agent_ip, if_idx) < std::tie(agent.agent_ip, agent.if_idx);
-    }
-} CounterAgent;
-
-typedef struct CounterRecord{
-    uint32_t if_speed;
-    uint32_t in_octets;
-    uint32_t out_octets;
-} CounterRecord;
 
 class SmartNicReader {
 public:
@@ -77,24 +82,29 @@ public:
      * @param cpp       NFP CPP handle
      * @param semAddr0  Address of _global_semaphores (primary buffer)
      * @param semAddr1  Address of _global_semaphores_dup (secondary buffer)
+     * @param keyAddr0  Address of __flow_key (primary buffer)
+     * @param keyAddr1  Address of __flow_key_dup (secondary buffer)
      * @param dataAddr0 Address of __flow_data (primary buffer)
      * @param dataAddr1 Address of __flow_data_dup (secondary buffer)
      * @param semIsland Island ID for semaphore registers
+     * @param keyIsland Island ID for flow key registers
      * @param dataIsland Island ID for flow data registers
      * @param slotCount Number of slots in the array (BUFFER_SIZE)
      */
     SmartNicReader(nfp_cpp *cpp,
                    uint64_t semAddr0, uint64_t semAddr1,
+                   uint64_t keyAddr0, uint64_t keyAddr1,
                    uint64_t dataAddr0, uint64_t dataAddr1,
-                   uint32_t semIsland, uint32_t dataIsland,
+                   uint32_t semIsland0, uint32_t keyIsland0, uint32_t dataIsland0,
+                   uint32_t semIsland1, uint32_t keyIsland1, uint32_t dataIsland1,
                    size_t slotCount);
 
     /**
      * Read flow data from SmartNIC using the semaphore-guarded double-buffer protocol:
      *   1. Read _global_semaphores
-     *   2. Fill _global_semaphores to 4 (lock)
-     *   3. For each slot where semaphore == 3, read the flow_data entry
-     *   4. Fill that flow_data slot to 0
+     *   2. Fill _global_semaphores to 7 (lock)
+     *   3. For each slot where semaphore == 3, read the __flow_key and __flow_data entries
+     *   4. Fill __flow_key and __flow_data to 0
      *   5. Fill _global_semaphores to 0 (unlock)
      *   6. Toggle the active buffer
      *
@@ -107,14 +117,17 @@ private:
 
     // Addresses for double buffers: [0] = primary, [1] = dup
     uint64_t semAddr_[2];
+    uint64_t keyAddr_[2];
     uint64_t dataAddr_[2];
 
     // CPP IDs for area operations
-    uint32_t semCppId_;
-    uint32_t dataCppId_;
+    uint32_t semCppId_[2];
+    uint32_t keyCppId_[2];
+    uint32_t dataCppId_[2];
 
     // Sizes
     unsigned long semSize_;
+    unsigned long keySize_;
     unsigned long dataSize_;
 
     // Number of slots
