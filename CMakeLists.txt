@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(SmartNIC-Sflow-Decoder LANGUAGES CXX)
 
+enable_testing()
+
 find_package(yaml-cpp REQUIRED)
 
 set(SPDLOG_DEBUG_POSTFIX "" CACHE STRING "" FORCE)
@@ -55,11 +57,30 @@ set_target_properties(${EXEC_NAME} PROPERTIES
 )
 target_compile_options(${EXEC_NAME} PRIVATE -Wall -Wextra -fdiagnostics-color=always -O3)
 
-add_executable(test test/main.cpp)
-target_include_directories(test PRIVATE "${NETRONOME_INCLUDE_DIR}")
-target_link_libraries(test PRIVATE ${NETRONOME_LIBS})
-set_target_properties(test PROPERTIES
+add_executable(nfp_reader_test test/main.cpp)
+target_include_directories(nfp_reader_test PRIVATE "${NETRONOME_INCLUDE_DIR}")
+target_link_libraries(nfp_reader_test PRIVATE ${NETRONOME_LIBS})
+set_target_properties(nfp_reader_test PROPERTIES
+	OUTPUT_NAME "test"
 	BUILD_RPATH "${NETRONOME_ROOT}/lib"
 	INSTALL_RPATH "${NETRONOME_ROOT}/lib"
 )
-target_compile_options(test PRIVATE -Wall -Wextra -fdiagnostics-color=always -O3)
+target_compile_options(nfp_reader_test PRIVATE -Wall -Wextra -fdiagnostics-color=always -O3)
+
+add_executable(time_calibration_test
+	test/time_calibration_test.cpp
+	src/Time.cpp
+)
+target_include_directories(time_calibration_test PRIVATE
+	include/
+	"${NETRONOME_INCLUDE_DIR}"
+)
+target_link_libraries(time_calibration_test PRIVATE ${NETRONOME_LIBS})
+set_target_properties(time_calibration_test PROPERTIES
+	BUILD_RPATH "${NETRONOME_ROOT}/lib"
+	INSTALL_RPATH "${NETRONOME_ROOT}/lib"
+)
+target_compile_options(time_calibration_test PRIVATE
+	-Wall -Wextra -fdiagnostics-color=always -O2
+)
+add_test(NAME time_calibration COMMAND time_calibration_test)

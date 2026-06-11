@@ -1,5 +1,5 @@
 devnum: 0
-runSecs: 14
+runSecs: 3
 targetIp: "192.168.1.4"
 targetPort: 6343
 semaphore_sym: "_global_semaphores"
@@ -10,4 +10,6 @@ flow_data_sym: "__flow_data"
 flow_data_dup_sym: "__flow_data_dup"
 counter_semaphore_sym: "_cglobal_semaphores"
 counter_data_sym: "__counter_data"
-offset_time: 0 # milliseconds added to SmartNIC timestamps before export
+cur_state_sym: "__cur_state"
+processing_me_sym: "__processing_me"
+mac_clock_xpb: 0x0840001c

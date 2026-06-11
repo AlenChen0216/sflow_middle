@@ -20,12 +20,13 @@
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 
+#include "../include/Time.hpp"
 #include "../include/Device.hpp"
 #include "../include/Reader.hpp"
 #include "../include/CounterReader.hpp"
 
 #define BUFFER_SIZE 20000
-#define BUFFER_SIZE2 1024
+#define BUFFER_SIZE2 2048
 
 namespace
 {
@@ -44,21 +45,16 @@ namespace
         std::queue<ExportData> queue;
     };
 
-    int64_t toAdjustedMilliseconds(mac_time_data ts, int64_t offsetTimeMs)
-    {
-        return static_cast<int64_t>(ts.sec) * 1000 +
-               static_cast<int64_t>(ts.nsec) / 1000000 +
-               offsetTimeMs;
-    }
-
     void smartNicIoThread(SmartNicReader &reader,
                           CounterReader &counterReader,
                           SharedQueue &shared,
+                          TimeAdjuster &timeAdjuster,
                           std::atomic<bool> &running,
-                          std::chrono::milliseconds period,
-                          int64_t offsetTimeMs)
+                          std::chrono::milliseconds period
+                          )
     {
         auto nextTick = std::chrono::steady_clock::now();
+        bool driftCalibrationReported = false;
 
         while (running.load())
         {
@@ -69,29 +65,27 @@ namespace
 
             std::vector<flow_data> flowEntries = reader.readFlowData();
             std::vector<counter_data> counterEntries = counterReader.readCounterData();
+            if (!timeAdjuster.refresh()) {
+                std::cerr << "Warning: SmartNIC clock refresh sample rejected; "
+                             "continuing with the previous calibration\n";
+            }
+            const CalibrationStatus calibration = timeAdjuster.status();
+            if (!calibration.drift_calibrated) {
+                driftCalibrationReported = false;
+            } else if (!driftCalibrationReported) {
+                std::cout << "SmartNIC clock drift calibrated: "
+                          << (calibration.scale - 1.0) * 1000000.0
+                          << " ppm, median residual "
+                          << calibration.median_residual_ns / 1000
+                          << " us, samples " << calibration.sample_count
+                          << "\n";
+                driftCalibrationReported = true;
+            }
 
             auto end = std::chrono::steady_clock::now();
             std::chrono::duration<double> elapsed = end - start;
             std::cout << "readFlowData() took " << elapsed.count() << " seconds and returned " << flowEntries.size() << " entries\n";
             
-            for(auto &f : flowEntries){
-                std::cout << "Read flow entry: src_ip=" << f.key.src_ip
-                          << ", dst_ip=" << f.key.dst_ip
-                          << ", src_port=" << f.key.src_port
-                          << ", dst_port=" << f.key.dst_port
-                          << ", protocol=" << f.key.protocol
-                          << ", agent_ip=" << f.key.agent_ip
-                          << ", in_if=" << f.key.in_if
-                          << ", out_if=" << f.key.out_if
-                          << ", byte_cnt=" << f.data.byte_cnt
-                          << ", packet_cnt=" << f.data.packet_cnt
-                          << ", start_time=" << toAdjustedMilliseconds(f.data.start_time, offsetTimeMs)
-                          << ", end_time=" << toAdjustedMilliseconds(f.data.end_time, offsetTimeMs)
-                          << ", sampling_rate=" << f.key.sampling_rate
-                          << ", tcp_flag=" << f.key.tcp_flag
-                          << std::endl;
-            }
-
             std::map<Tuple, FlowRecord> localFlowMap;
             std::map<CounterAgent, CounterRecord> localCounterMap;
 
@@ -103,23 +97,37 @@ namespace
                     Tuple key{};
                     key.src_ip = entry.key.src_ip;
                     key.dst_ip = entry.key.dst_ip;
-                    key.src_port = entry.key.src_port;
-                    key.dst_port = entry.key.dst_port;
-                    key.protocol = static_cast<uint8_t>(entry.key.protocol);
+                    key.src_port = entry.key.dst_port;
+                    key.dst_port = entry.key.src_port;
+                    key.protocol = static_cast<uint16_t>(entry.key.protocol);
 
                     Agent agent{};
                     agent.aip = entry.key.agent_ip;
-                    agent.in_if = static_cast<uint32_t>(entry.key.in_if);
-                    agent.out_if = static_cast<uint32_t>(entry.key.out_if);
+                    agent.in_if = static_cast<uint32_t>(entry.key.out_if);
+                    agent.out_if = static_cast<uint32_t>(entry.key.in_if);
                     agent.byte_cnt = entry.data.byte_cnt;
                     agent.packet_cnt = entry.data.packet_cnt;
-                    agent.start_time = toAdjustedMilliseconds(entry.data.start_time, offsetTimeMs);
-                    agent.end_time = toAdjustedMilliseconds(entry.data.end_time, offsetTimeMs);
                     agent.sampling_rate = entry.key.sampling_rate;
-                    agent.tcp_flag = static_cast<uint8_t>(entry.key.tcp_flag);
+                    agent.tcp_flag = static_cast<uint16_t>(entry.key.tcp_flag);
                     agent.index = entry.index;
                     
-                    localFlowMap[key].agent.push_back(agent);
+                    const int64_t startTimeNs =
+                        timeAdjuster.toUnixNanoseconds(
+                            entry.data.start_time.sec,
+                            entry.data.start_time.nsec);
+                    const int64_t endTimeNs =
+                        timeAdjuster.toUnixNanoseconds(
+                            entry.data.end_time.sec,
+                            entry.data.end_time.nsec);
+
+                    FlowRecord &record = localFlowMap[key];
+                    record.agent.push_back(agent);
+                    record.start_time_ns =
+                        std::min(record.start_time_ns, startTimeNs);
+                    record.end_time_ns =
+                        std::max(record.end_time_ns, endTimeNs);
+                    record.start_time = record.start_time_ns / 1000000;
+                    record.end_time = record.end_time_ns / 1000000;
                 }
 
                 
@@ -202,6 +210,9 @@ namespace
                 item["src_port"] = key.src_port;
                 item["dst_port"] = key.dst_port;
                 item["protocol"] = key.protocol;
+                item["start_time"] = record.start_time;
+                item["end_time"] = record.end_time;
+                // std::cout<<"Start time: "<<record.start_time<<", End time: "<<record.end_time<<std::endl;
 
                 nlohmann::json agents = nlohmann::json::array();
                 for (const auto &ag : record.agent)
@@ -211,8 +222,6 @@ namespace
                                       {"out_if", ag.out_if},
                                       {"byte_cnt", ag.byte_cnt},
                                       {"packet_cnt", ag.packet_cnt},
-                                      {"start_time", ag.start_time},
-                                      {"end_time", ag.end_time},
                                       {"sampling_rate", ag.sampling_rate},
                                       {"tcp_flag", ag.tcp_flag},
                                       {"index", ag.index}});
@@ -249,7 +258,11 @@ namespace
         close(sock);
         testFile.close();
     }
+
 } // namespace
+
+
+
 
 int main(int argc, char *argv[])
 {
@@ -268,7 +281,9 @@ int main(int argc, char *argv[])
     std::string flowDataDupSym = "__flow_data_dup";
     std::string counterSemSym = "_cglobal_semaphores";
     std::string counterDataSym = "__counter_data";
-    int64_t offsetTimeMs = 0;
+    std::string curStateSym = "__cur_state";
+    std::string processingMeSym = "__processing_me";
+    uint32_t macClockXpb = TimeAdjuster::kDefaultMacClockXpbAddress;
 
     try
     {
@@ -298,8 +313,15 @@ int main(int argc, char *argv[])
             counterSemSym = config["counter_semaphore_sym"].as<std::string>();
         if (config["counter_data_sym"])
             counterDataSym = config["counter_data_sym"].as<std::string>();
-        if (config["offset_time"])
-            offsetTimeMs = config["offset_time"].as<int64_t>();
+        if (config["cur_state_sym"])
+            curStateSym = config["cur_state_sym"].as<std::string>();
+        if (config["processing_me_sym"])
+            processingMeSym = config["processing_me_sym"].as<std::string>();
+        if (config["mac_clock_xpb"])
+            macClockXpb = config["mac_clock_xpb"].as<uint32_t>();
+        if (config["offset_time"] || config["time_sym"])
+            std::cerr << "Warning: offset_time and time_sym are deprecated "
+                         "and ignored; using the live NBI MAC clock\n";
     }
     catch (const YAML::Exception &e)
     {
@@ -324,8 +346,12 @@ int main(int argc, char *argv[])
     const nfp_rtsym *symDataDup = dev->getSymbolData(flowDataDupSym.c_str());
     const nfp_rtsym *symCounterSem = dev->getSymbolData(counterSemSym.c_str());
     const nfp_rtsym *symCounterData = dev->getSymbolData(counterDataSym.c_str());
+    const nfp_rtsym *symCurState = dev->getSymbolData(curStateSym.c_str());
+    const nfp_rtsym *symProcessingMe = dev->getSymbolData(processingMeSym.c_str());
 
-    if (!symSem || !symSemDup || !symKey || !symKeyDup || !symData || !symDataDup || !symCounterSem || !symCounterData) {
+    if (!symSem || !symSemDup || !symKey || !symKeyDup ||
+        !symData || !symDataDup || !symCounterSem || !symCounterData ||
+        !symCurState || !symProcessingMe) {
         std::cerr << "Fatal: one or more required symbols not found on SmartNIC\n";
         if (!symSem)      std::cerr << "  missing: " << semSym << "\n";
         if (!symSemDup)   std::cerr << "  missing: " << semDupSym << "\n";
@@ -335,9 +361,13 @@ int main(int argc, char *argv[])
         if (!symDataDup)  std::cerr << "  missing: " << flowDataDupSym << "\n";
         if (!symCounterSem) std::cerr << "  missing: " << counterSemSym << "\n";
         if (!symCounterData) std::cerr << "  missing: " << counterDataSym << "\n";
+        if (!symCurState) std::cerr << "  missing: " << curStateSym << "\n";
+        if (!symProcessingMe) std::cerr << "  missing: " << processingMeSym << "\n";
         return 1;
     }
     std::cout<< "Successfully found all required symbols on SmartNIC\n";
+    std::cout<< ""  << "  " << curStateSym << ": addr=0x" << std::hex << symCurState->addr << std::dec << ", domain=" << symCurState->domain << "\n";
+    std::cout<< ""  << "  " << processingMeSym << ": addr=0x" << std::hex << symProcessingMe->addr << std::dec << ", domain=" << symProcessingMe->domain << "\n";
     std::cout<< ""  << "  " << semSym << ": addr=0x" << std::hex << symSem->addr << std::dec << ", domain=" << symSem->domain << "\n";
     std::cout<< ""  << "  " << semDupSym << ": addr=0x" << std::hex << symSemDup->addr << std::dec << ", domain=" << symSemDup->domain << "\n";
     std::cout<< ""  << "  " << flowKeySym << ": addr=0x" << std::hex << symKey->addr << std::dec << ", domain=" << symKey->domain << "\n";
@@ -346,9 +376,12 @@ int main(int argc, char *argv[])
     std::cout<< ""  << "  " << flowDataDupSym << ": addr=0x" << std::hex << symDataDup->addr << std::dec << ", domain=" << symDataDup->domain << "\n";
     std::cout<< ""  << "  " << counterSemSym << ": addr=0x" << std::hex << symCounterSem->addr << std::dec << ", domain=" << symCounterSem->domain << "\n";
     std::cout<< ""  << "  " << counterDataSym << ": addr=0x" << std::hex << symCounterData->addr << std::dec << ", domain=" << symCounterData->domain << "\n";
-    std::cout<< ""  << "  offset_time: " << offsetTimeMs << " ms\n";
+    std::cout << "  MAC clock XPB: 0x" << std::hex << macClockXpb
+              << std::dec << "\n";
 
     SmartNicReader reader(dev->cpp(),
+                          symCurState->addr, symCurState->domain,
+                          symProcessingMe->addr, symProcessingMe->domain,
                           symSem->addr, symSemDup->addr,
                           symKey->addr, symKeyDup->addr,
                           symData->addr, symDataDup->addr,
@@ -366,13 +399,29 @@ int main(int argc, char *argv[])
     SharedQueue shared;
     std::atomic<bool> running{true};
 
+    std::unique_ptr<TimeAdjuster> timeAdjuster;
+    try
+    {
+        timeAdjuster = std::make_unique<TimeAdjuster>(
+            dev->cpp(), macClockXpb);
+    }
+    catch (const std::exception &ex)
+    {
+        std::cerr << "Fatal: " << ex.what() << '\n';
+        return 1;
+    }
+    const CalibrationStatus initialCalibration = timeAdjuster->status();
+    std::cout << "SmartNIC clock calibrated: minimum latency "
+              << initialCalibration.minimum_latency_ns / 1000
+              << " us, samples " << initialCalibration.sample_count << "\n";
+
     std::thread nicThread(smartNicIoThread,
                           std::ref(reader),
                           std::ref(counterReader),
                           std::ref(shared),
+                          std::ref(*timeAdjuster),
                           std::ref(running),
-                          std::chrono::seconds(1),
-                          offsetTimeMs);
+                          std::chrono::seconds(1));
 
     std::thread txThread(transmitThread,
                          std::ref(shared),

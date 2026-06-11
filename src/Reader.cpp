@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <thread>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -18,12 +19,14 @@ constexpr uint32_t kSemUnlockValue = 0;
 constexpr uint32_t kDataClearValue = 0;
 constexpr uint32_t kSemDataReady = 3;
 
-static_assert(sizeof(stored_flow_key) == 28, "stored_flow_key wire size changed");
+static_assert(sizeof(stored_flow_key) == 32, "stored_flow_key wire size changed");
 static_assert(sizeof(mac_time_data) == 8, "mac_time_data wire size changed");
-static_assert(sizeof(stored_flow_data) == 24, "stored_flow_data wire size changed");
+static_assert(sizeof(stored_flow_data) == 32, "stored_flow_data wire size changed");
 }  // namespace
 
 SmartNicReader::SmartNicReader(nfp_cpp *cpp,
+                               uint64_t staAddr, uint64_t staIsland,
+                               uint64_t proAddr, uint64_t proIsland,
                                uint64_t semAddr0, uint64_t semAddr1,
                                uint64_t keyAddr0, uint64_t keyAddr1,
                                uint64_t dataAddr0, uint64_t dataAddr1,
@@ -32,6 +35,8 @@ SmartNicReader::SmartNicReader(nfp_cpp *cpp,
                                size_t slotCount)
     : cpp_(cpp), slotCount_(slotCount), bufferState_(0)
 {
+    staAddr_ = staAddr;
+    proAddr_ = proAddr;
     semAddr_[0] = semAddr0;
     semAddr_[1] = semAddr1;
     keyAddr_[0] = keyAddr0;
@@ -39,9 +44,13 @@ SmartNicReader::SmartNicReader(nfp_cpp *cpp,
     dataAddr_[0] = dataAddr0;
     dataAddr_[1] = dataAddr1;
 
+
     semSize_ = static_cast<unsigned long>(slotCount_ * sizeof(uint32_t));
     keySize_ = static_cast<unsigned long>(slotCount_ * sizeof(stored_flow_key));
     dataSize_ = static_cast<unsigned long>(slotCount_ * sizeof(stored_flow_data));
+
+    staCppId_ = NFP_CPP_ISLAND_ID(kCppTargetMem, kCppActionWrite, 0, staIsland);
+    proCppId_ = NFP_CPP_ISLAND_ID(kCppTargetMem, kCppActionWrite, 0, proIsland);
 
     semCppId_[0] = NFP_CPP_ISLAND_ID(kCppTargetMem, kCppActionWrite, 0, semIsland0);
     keyCppId_[0] = NFP_CPP_ISLAND_ID(kCppTargetMem, kCppActionWrite, 0, keyIsland0);
@@ -52,28 +61,83 @@ SmartNicReader::SmartNicReader(nfp_cpp *cpp,
 }
 
 std::vector<flow_data> SmartNicReader::readFlowData() noexcept {
+    // 1. Read the currently active bank from _cur_state.
+    // 2. Switch _cur_state to the other bank.
+    // 3. Wait until the old bank has no ME contexts using it.
+    // 4. Read key/data from the old bank.
+    // 5. Clear key/data first, then clear semaphores last.
+
     if (!cpp_ || slotCount_ == 0) {
         return {};
     }
 
     std::vector<flow_data> result;
 
-    // -------------------------------------------------------------------------
-    // Step 1: Read the _global_semaphores of the active buffer
-    // -------------------------------------------------------------------------
-    std::cout<< "Current stat : "<< bufferState_ << std::endl;
-    const uint64_t semAddr = semAddr_[bufferState_];
-    const uint32_t semCppId = semCppId_[bufferState_];
-    auto unlockSemaphores = [&]() {
-        nfp_cpp_area *unlockArea = nfp_cpp_area_alloc(cpp_, semCppId, semAddr, semSize_);
-        if (unlockArea) {
-            if (nfp_cpp_area_acquire(unlockArea) >= 0) {
-                nfp_cpp_area_fill(unlockArea, 0, kSemUnlockValue, semSize_);
-            }
-            nfp_cpp_area_release_free(unlockArea);
-        }
-    };
+    const uint64_t staAddr = staAddr_;
+    const uint32_t staCppId = staCppId_;
+    const uint64_t proAddr = proAddr_;
+    const uint32_t proCppId = proCppId_;
 
+    // Step 1: read the current hardware state instead of trusting local state.
+    nfp_cpp_area *staArea = nfp_cpp_area_alloc(cpp_, staCppId, staAddr, sizeof(uint32_t));
+    if (!staArea) {
+        return {};
+    }
+    if (nfp_cpp_area_acquire(staArea) < 0) {
+        nfp_cpp_area_free(staArea);
+        return {};
+    }
+
+    uint32_t staValue = 0;
+    int staBytesRead = nfp_cpp_area_read(staArea, 0, &staValue, sizeof(uint32_t));
+    if (staBytesRead != static_cast<int>(sizeof(uint32_t))) {
+        nfp_cpp_area_release_free(staArea);
+        return {};
+    }
+
+    const int ori_bufferState = static_cast<int>(staValue & 1);
+    const int next_bufferState = 1 - ori_bufferState;
+
+    const uint64_t semAddr = semAddr_[ori_bufferState];
+    const uint32_t semCppId = semCppId_[ori_bufferState];
+    const uint64_t keyAddr = keyAddr_[ori_bufferState];
+    const uint32_t keyCppId = keyCppId_[ori_bufferState];
+    const uint64_t dataAddr = dataAddr_[ori_bufferState];
+    const uint32_t dataCppId = dataCppId_[ori_bufferState];
+
+    // Step 2: publish the new active bank.
+    staValue = static_cast<uint32_t>(next_bufferState);
+    int staBytesWritten = nfp_cpp_area_fill(staArea, 0, staValue, sizeof(uint32_t));
+    nfp_cpp_area_release_free(staArea);
+    if (staBytesWritten != static_cast<int>(sizeof(uint32_t))) {
+        return {};
+    }
+    bufferState_ = next_bufferState;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Step 3: wait until the old bank is quiescent.
+    nfp_cpp_area *proArea = nfp_cpp_area_alloc(cpp_, proCppId, proAddr, sizeof(uint32_t) * 2);
+    if (!proArea) {
+        return {};
+    }
+    if (nfp_cpp_area_acquire(proArea) < 0) {
+        nfp_cpp_area_free(proArea);
+        return {};
+    }
+    while (true) {
+        uint32_t proValue = 0;
+        int proBytesRead = nfp_cpp_area_read(proArea, ori_bufferState * sizeof(uint32_t), &proValue, sizeof(uint32_t));
+        if (proBytesRead != static_cast<int>(sizeof(uint32_t))) {
+            nfp_cpp_area_release_free(proArea);
+            return {};
+        }
+        if (proValue == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    nfp_cpp_area_release_free(proArea);
+
+    // Step 4: read the semaphores of the old bank and find the valid data.
     nfp_cpp_area *semArea = nfp_cpp_area_alloc(cpp_, semCppId, semAddr, semSize_);
     if (!semArea) {
         return {};
@@ -82,7 +146,6 @@ std::vector<flow_data> SmartNicReader::readFlowData() noexcept {
         nfp_cpp_area_free(semArea);
         return {};
     }
-
     std::vector<uint32_t> semaphores(slotCount_, 0);
     int bytesRead = nfp_cpp_area_read(semArea, 0, semaphores.data(), semSize_);
     if (bytesRead != static_cast<int>(semSize_)) {
@@ -90,55 +153,38 @@ std::vector<flow_data> SmartNicReader::readFlowData() noexcept {
         return {};
     }
 
-    // -------------------------------------------------------------------------
-    // Step 2: Fill the _global_semaphores to 7 (lock — tell SmartNIC we are reading)
-    // -------------------------------------------------------------------------
-    nfp_cpp_area_fill(semArea, 0, kSemLockValue, semSize_);
-    nfp_cpp_area_release_free(semArea);
-    
     std::vector<size_t> haveData;
-    for(size_t i=0;i<slotCount_;++i) {
-        if(semaphores[i] == kSemDataReady) {
+    for (size_t i = 0; i < slotCount_; ++i) {
+        if (semaphores[i] == kSemDataReady) {
             haveData.push_back(i);
         }
     }
-    // -------------------------------------------------------------------------
-    // Step 3 & 4: Read __flow_key and __flow_data for slots where semaphore == 3,
-    //             then fill both areas to 0.
-    // -------------------------------------------------------------------------
-    const uint64_t keyAddr = keyAddr_[bufferState_];
-    const uint32_t keyCppId = keyCppId_[bufferState_];
-    const uint64_t dataAddr = dataAddr_[bufferState_];
-    const uint32_t dataCppId = dataCppId_[bufferState_];
 
+    // Step 5: read the valid data and clear the old bank.
     nfp_cpp_area *keyArea = nfp_cpp_area_alloc(cpp_, keyCppId, keyAddr, keySize_);
     if (!keyArea) {
-        unlockSemaphores();
+        nfp_cpp_area_release_free(semArea);
         return {};
     }
     if (nfp_cpp_area_acquire(keyArea) < 0) {
         nfp_cpp_area_free(keyArea);
-        unlockSemaphores();
+        nfp_cpp_area_release_free(semArea);
         return {};
     }
-
     nfp_cpp_area *dataArea = nfp_cpp_area_alloc(cpp_, dataCppId, dataAddr, dataSize_);
     if (!dataArea) {
         nfp_cpp_area_release_free(keyArea);
-        unlockSemaphores();
+        nfp_cpp_area_release_free(semArea);
         return {};
     }
     if (nfp_cpp_area_acquire(dataArea) < 0) {
         nfp_cpp_area_free(dataArea);
         nfp_cpp_area_release_free(keyArea);
-        unlockSemaphores();
+        nfp_cpp_area_release_free(semArea);
         return {};
     }
 
-    const unsigned long flowKeyEntrySize = static_cast<unsigned long>(sizeof(stored_flow_key));
-    const unsigned long flowDataEntrySize = static_cast<unsigned long>(sizeof(stored_flow_data));
-
-    for(auto &i : haveData){
+    for (auto &i : haveData) {
         flow_data entry{};
         int keyBytesRead = nfp_cpp_area_read(keyArea, i * flowKeyEntrySize, &entry.key, sizeof(stored_flow_key));
         if (keyBytesRead != static_cast<int>(sizeof(stored_flow_key))) {
@@ -151,20 +197,20 @@ std::vector<flow_data> SmartNicReader::readFlowData() noexcept {
         entry.index = i;
         result.push_back(entry);
     }
-    nfp_cpp_area_fill(keyArea, 0, kDataClearValue, keySize_); // Clear entire area to be safe
-    nfp_cpp_area_fill(dataArea, 0, kDataClearValue, dataSize_); // Clear entire area to be safe
+
+    const int keyBytesCleared = nfp_cpp_area_fill(keyArea, 0, kDataClearValue, keySize_);
+    const int dataBytesCleared = nfp_cpp_area_fill(dataArea, 0, kDataClearValue, dataSize_);
+    const int semBytesCleared = nfp_cpp_area_fill(semArea, 0, kSemUnlockValue, semSize_);
+
     nfp_cpp_area_release_free(keyArea);
     nfp_cpp_area_release_free(dataArea);
+    nfp_cpp_area_release_free(semArea);
 
-    // -------------------------------------------------------------------------
-    // Step 5: Fill the _global_semaphores to 0 (unlock — tell SmartNIC we are done)
-    // -------------------------------------------------------------------------
-    unlockSemaphores();
-
-    // -------------------------------------------------------------------------
-    // Step 6: Toggle the active buffer for the next read
-    // -------------------------------------------------------------------------
-    bufferState_ = 1 - bufferState_;
+    // if (keyBytesCleared != static_cast<int>(keySize_) ||
+    //     dataBytesCleared != static_cast<int>(dataSize_) ||
+    //     semBytesCleared != static_cast<int>(semSize_)) {
+    //     return {};
+    // }
 
     return result;
 }
