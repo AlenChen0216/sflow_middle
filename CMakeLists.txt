@@ -11,6 +11,7 @@ add_subdirectory(./lib2/json)
 
 find_package(fmt REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Boost REQUIRED COMPONENTS system)
 
 set(EXEC_NAME "MID")
 
@@ -50,7 +51,7 @@ endif()
 add_executable(${EXEC_NAME} ${SOURCES})
 target_include_directories(${EXEC_NAME} PRIVATE include/)
 target_include_directories(${EXEC_NAME} PRIVATE "${NETRONOME_INCLUDE_DIR}")
-target_link_libraries(${EXEC_NAME} PRIVATE Threads::Threads yaml-cpp spdlog::spdlog fmt::fmt nlohmann_json::nlohmann_json ${NETRONOME_LIBS})
+target_link_libraries(${EXEC_NAME} PRIVATE Threads::Threads Boost::system yaml-cpp spdlog::spdlog fmt::fmt nlohmann_json::nlohmann_json ${NETRONOME_LIBS})
 set_target_properties(${EXEC_NAME} PROPERTIES
 	BUILD_RPATH "${NETRONOME_ROOT}/lib"
 	INSTALL_RPATH "${NETRONOME_ROOT}/lib"

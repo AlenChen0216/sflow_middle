@@ -1,5 +1,5 @@
 devnum: 0
-runSecs: 3
+runSecs: 4
 targetIp: "192.168.1.4"
 targetPort: 6343
 semaphore_sym: "_global_semaphores"

@@ -12,11 +12,9 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <queue>
 #include <fstream>
+#include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
 
@@ -27,6 +25,9 @@
 
 #define BUFFER_SIZE 20000
 #define BUFFER_SIZE2 2048
+#define MAX_JSON_SIZE 1500
+
+std::atomic<bool> running{true};
 
 namespace
 {
@@ -49,7 +50,6 @@ namespace
                           CounterReader &counterReader,
                           SharedQueue &shared,
                           TimeAdjuster &timeAdjuster,
-                          std::atomic<bool> &running,
                           std::chrono::milliseconds period
                           )
     {
@@ -159,31 +159,52 @@ namespace
         }
     }
 
-    void transmitThread(SharedQueue &shared, std::atomic<bool> &running,
+    void transmitThread(SharedQueue &shared,
                         const std::string &target_ip, uint16_t target_port)
     {
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0)
+        namespace asio = boost::asio;
+        using udp = asio::ip::udp;
+
+        asio::io_service io;
+        std::unique_ptr<asio::io_service::work> work;
+        std::unique_ptr<udp::socket> socket;
+        udp::endpoint destination;
+        try
         {
-            std::cerr << "Failed to create socket.\n";
+            destination = udp::endpoint(
+                asio::ip::address::from_string(target_ip), target_port);
+            socket.reset(new udp::socket(io, udp::v4()));
+            work.reset(new asio::io_service::work(io));
+        }
+        catch (const boost::system::system_error &error)
+        {
+            std::cerr << "Failed to initialize UDP sender: "
+                      << error.what() << '\n';
             return;
         }
+
         std::fstream testFile;
         testFile.open("test_output.json", std::ios::out);
         if( !testFile.is_open() ) {
             std::cerr << "Failed to open test_output.json for writing.\n";
-            close(sock);
             return;
         }
-        struct sockaddr_in dest_addr{};
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(target_port);
-        if (inet_pton(AF_INET, target_ip.c_str(), &dest_addr.sin_addr) <= 0)
-        {
-            std::cerr << "Invalid address.\n";
-            close(sock);
-            return;
-        }
+
+        std::thread ioThread([&io] { io.run(); });
+        auto queueSend = [&](std::string payload) {
+            auto data = std::make_shared<std::string>(std::move(payload));
+            io.post([&, data] {
+                socket->async_send_to(
+                    asio::buffer(*data), destination,
+                    [data](const boost::system::error_code &error, std::size_t) {
+                        if (error)
+                        {
+                            std::cerr << "UDP send failed: "
+                                      << error.message() << '\n';
+                        }
+                    });
+            });
+        };
         
         while (running.load())
         {
@@ -199,11 +220,11 @@ namespace
                 data = std::move(shared.queue.front());
                 shared.queue.pop();
             }
-
-            nlohmann::json j;
-            nlohmann::json flowArray = nlohmann::json::array();
+            nlohmann::json for_record;
+            nlohmann::json for_record_agents = nlohmann::json::array();
             for (const auto &[key, record] : data.flowMap)
             {
+                nlohmann::json j;
                 nlohmann::json item;
                 item["src_ip"] = key.src_ip;
                 item["dst_ip"] = key.dst_ip;
@@ -227,42 +248,49 @@ namespace
                                       {"index", ag.index}});
                 }
                 item["agent"] = agents;
-                flowArray.push_back(item);
+                nlohmann::json flowArray = nlohmann::json::array({item});
+                for_record_agents.push_back(item);
+                j["flowMap"] = flowArray;
+                queueSend(j.dump());
             }
-            j["flowMap"] = flowArray;
+            for_record["execution_time"] = data.execution_time;
+            for_record["flowMap"] = for_record_agents;
 
-            nlohmann::json counterArray = nlohmann::json::array();
+            nlohmann::json for_record_counterArray = nlohmann::json::array();
             for (const auto &[key, record] : data.counterMap)
             {
+                nlohmann::json j;
                 nlohmann::json item;
+
                 item["agent_ip"] = key.agent_ip;
                 item["if_idx"] = key.if_idx;
                 item["if_speed"] = record.if_speed;
                 item["in_octets"] = record.in_octets;
                 item["out_octets"] = record.out_octets;
-                counterArray.push_back(item);
+                nlohmann::json counterArray = nlohmann::json::array({item});
+                for_record_counterArray.push_back(item);
+                j["counterMap"] = counterArray;
+                queueSend(j.dump());
             }
-            j["execution_time"] = data.execution_time;
-            j["counterMap"] = counterArray;
-            if (j["flowMap"].empty() && j["counterMap"].empty())
-            {
-                std::cout << "No data to send.\n";
-                continue;
-            }
-            std::string payload = j.dump();
-            // std::cout << "sending data: " << payload << "\n";
+            for_record["counterMap"] = for_record_counterArray;
+            std::string payload = for_record.dump();
+            // std::string payload = for_record.dump();
             testFile << payload << std::endl;
-            sendto(sock, payload.data(), payload.size(), 0,
-                   reinterpret_cast<struct sockaddr *>(&dest_addr), sizeof(dest_addr));
         }
-        close(sock);
+        work.reset();
+        ioThread.join();
         testFile.close();
     }
 
 } // namespace
 
 
-
+void signalHandler(int signum)
+{
+    
+    std::cout << "Interrupt signal received. Stopping...\n";
+    running.store(false);
+}
 
 int main(int argc, char *argv[])
 {
@@ -271,6 +299,9 @@ int main(int argc, char *argv[])
     std::string targetIp = "192.168.1.4";
     uint16_t targetPort = 6343;
     std::unique_ptr<NFPDevice> dev;
+
+    signal(SIGINT,signalHandler);
+    signal(SIGTERM,signalHandler);
 
     // Symbol names for the 4 registers (configurable via YAML)
     std::string semSym = "_global_semaphores";
@@ -397,7 +428,6 @@ int main(int argc, char *argv[])
                                 BUFFER_SIZE2);
 
     SharedQueue shared;
-    std::atomic<bool> running{true};
 
     std::unique_ptr<TimeAdjuster> timeAdjuster;
     try
@@ -420,12 +450,10 @@ int main(int argc, char *argv[])
                           std::ref(counterReader),
                           std::ref(shared),
                           std::ref(*timeAdjuster),
-                          std::ref(running),
                           std::chrono::seconds(1));
 
     std::thread txThread(transmitThread,
                          std::ref(shared),
-                         std::ref(running),
                          targetIp,
                          targetPort);
 

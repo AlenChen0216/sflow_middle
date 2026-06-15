@@ -123,6 +123,35 @@ void testRobustDriftFit()
             "synthetic P99 mapping error exceeds 500 microseconds");
 }
 
+void testDriftFitDuringShortRun()
+{
+    ClockCalibration calibration;
+    require(calibration.initialize(startupSamples()),
+            "short-run drift test startup calibration failed");
+
+    constexpr double scale = 1.000500;
+    for (int second = 1; second <= 3; ++second) {
+        require(calibration.addSample(
+                    sampleAt(second * kSecond, scale, 0, 80000)),
+                "short-run drift sample was rejected");
+    }
+
+    const auto status = calibration.status();
+    require(status.drift_calibrated,
+            "drift calibration did not become active during a short run");
+    require(std::abs(status.scale - scale) < 0.000010,
+            "short-run drift estimate differs by more than ten ppm");
+
+    const int64_t elapsed = 4 * kSecond;
+    const int64_t expected =
+        kUnixBase + static_cast<int64_t>(std::llround(
+            static_cast<long double>(elapsed) * scale));
+    require(std::llabs(
+                calibration.toUnixNanoseconds(kMacBase + elapsed) -
+                expected) < 100000,
+            "short-run drift compensation exceeds 100 microseconds");
+}
+
 void testClockResets()
 {
     ClockCalibration calibration;
@@ -170,6 +199,7 @@ int main()
         testAtomicMacTime();
         testStartupOffsetAndLatencyFiltering();
         testRobustDriftFit();
+        testDriftFitDuringShortRun();
         testClockResets();
         testLargeEpochAndMonotonicConversion();
     } catch (const std::exception &ex) {

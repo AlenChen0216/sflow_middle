@@ -11,7 +11,7 @@
 namespace
 {
 constexpr int64_t kNanosecondsPerSecond = 1000000000LL;
-constexpr int64_t kClockStepThresholdNs = 5000000;
+constexpr int64_t kClockStepThresholdNs = 500000;
 constexpr int64_t kModelStepThresholdNs = 20000000;
 constexpr double kMaximumDriftPpm = 1000.0;
 constexpr std::size_t kStartupSampleCount = 64;

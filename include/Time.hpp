@@ -10,6 +10,14 @@ extern "C" {
 #include <nfp_cpp.h>
 }
 
+struct mac_time_state {
+    uint32_t mac_time_s; /* last synced mac time seconds */
+    uint32_t mac_time_ns; /* last synced mac time nanoseconds */
+    uint32_t me_time; /* me cycle time at last sync */
+    uint16_t conv_mult; /* multiplier to convert me time to ns */
+    uint16_t conv_rshift; /* right shift to convert me time to ns */
+};
+
 struct TimeSample
 {
     int64_t mac_ns = 0;
@@ -41,7 +49,7 @@ class ClockCalibration
 public:
     static constexpr int64_t kMaximumSampleLatencyNs = 800000;
     static constexpr int64_t kRegressionWindowNs = 120000000000LL;
-    static constexpr int64_t kMinimumRegressionSpanNs = 10000000000LL;
+    static constexpr int64_t kMinimumRegressionSpanNs = 5000000000LL;
 
     bool initialize(const std::vector<TimeSample> &samples);
     bool addSample(const TimeSample &sample);
