@@ -130,7 +130,7 @@ void testDriftFitDuringShortRun()
             "short-run drift test startup calibration failed");
 
     constexpr double scale = 1.000500;
-    for (int second = 1; second <= 3; ++second) {
+    for (int second = 1; second <= 6; ++second) {
         require(calibration.addSample(
                     sampleAt(second * kSecond, scale, 0, 80000)),
                 "short-run drift sample was rejected");
@@ -142,7 +142,7 @@ void testDriftFitDuringShortRun()
     require(std::abs(status.scale - scale) < 0.000010,
             "short-run drift estimate differs by more than ten ppm");
 
-    const int64_t elapsed = 4 * kSecond;
+    const int64_t elapsed = 7 * kSecond;
     const int64_t expected =
         kUnixBase + static_cast<int64_t>(std::llround(
             static_cast<long double>(elapsed) * scale));

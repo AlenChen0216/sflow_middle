@@ -7,17 +7,11 @@
 #include <stdexcept>
 #include <thread>
 #include <time.h>
+#include <utility>
 
 namespace
 {
-constexpr int64_t kNanosecondsPerSecond = 1000000000LL;
-constexpr int64_t kClockStepThresholdNs = 500000;
-constexpr int64_t kModelStepThresholdNs = 20000000;
-constexpr double kMaximumDriftPpm = 1000.0;
-constexpr std::size_t kStartupSampleCount = 64;
 constexpr std::size_t kStartupBestSampleCount = 8;
-constexpr std::size_t kRefreshBurstSize = 8;
-constexpr int kRegisterReadRetries = 4;
 
 int64_t clockNanoseconds(clockid_t clockId)
 {
@@ -121,6 +115,16 @@ bool composeAtomicMacTime(uint32_t secondsBefore,
     return true;
 }
 
+ClockCalibration::ClockCalibration()
+    : ClockCalibration(Config{})
+{
+}
+
+ClockCalibration::ClockCalibration(Config config)
+    : config_(config)
+{
+}
+
 bool ClockCalibration::initialize(const std::vector<TimeSample> &samples)
 {
     reset();
@@ -129,7 +133,7 @@ bool ClockCalibration::initialize(const std::vector<TimeSample> &samples)
     accepted.reserve(samples.size());
     for (const auto &sample : samples) {
         if (sample.latency_ns >= 0 &&
-            sample.latency_ns <= kMaximumSampleLatencyNs &&
+            sample.latency_ns <= config_.maximum_sample_latency_ns &&
             sample.mac_ns > 0 && sample.unix_ns > 0) {
             accepted.push_back(sample);
         } else {
@@ -186,12 +190,14 @@ void ClockCalibration::setOffsetModel(const std::vector<TimeSample> &samples)
     status_.sample_count = samples.size();
     status_.valid = true;
     status_.drift_calibrated = false;
+    status_.accepted_samples += samples.size();
+    status_.state = CalibrationState::OffsetOnly;
 }
 
 bool ClockCalibration::addSample(const TimeSample &sample)
 {
     if (sample.latency_ns < 0 ||
-        sample.latency_ns > kMaximumSampleLatencyNs ||
+        sample.latency_ns > config_.maximum_sample_latency_ns ||
         sample.mac_ns <= 0 || sample.unix_ns <= 0) {
         ++status_.rejected_samples;
         return false;
@@ -204,6 +210,7 @@ bool ClockCalibration::addSample(const TimeSample &sample)
         status_.scale = 1.0;
         status_.sample_count = 1;
         status_.valid = true;
+        status_.state = CalibrationState::OffsetOnly;
         samples_.push_back(sample);
     } else {
         const int64_t realtimeElapsed = sample.unix_ns - last_unix_ns_;
@@ -213,10 +220,10 @@ bool ClockCalibration::addSample(const TimeSample &sample)
         const bool hostClockStep =
             last_monotonic_ns_ != 0 &&
             std::llabs(realtimeElapsed - monotonicElapsed) >
-                kClockStepThresholdNs;
+                config_.host_step_threshold_ns;
         const bool modelStep =
             std::llabs(toUnixNanoseconds(sample.mac_ns) - sample.unix_ns) >
-                kModelStepThresholdNs;
+                config_.model_step_threshold_ns;
 
         if (macRollback || hostClockStep || modelStep) {
             const std::size_t rejected = status_.rejected_samples + 1;
@@ -228,6 +235,7 @@ bool ClockCalibration::addSample(const TimeSample &sample)
             status_.scale = 1.0;
             status_.sample_count = 1;
             status_.valid = true;
+            status_.state = CalibrationState::OffsetOnly;
             samples_.push_back(sample);
         } else {
             samples_.push_back(sample);
@@ -242,14 +250,19 @@ bool ClockCalibration::addSample(const TimeSample &sample)
 
     while (!samples_.empty() &&
            sample.monotonic_ns - samples_.front().monotonic_ns >
-               kRegressionWindowNs) {
+               config_.regression_window_ns) {
         samples_.pop_front();
     }
     status_.sample_count = samples_.size();
+    status_.accepted_samples = std::max(status_.accepted_samples,
+                                        status_.sample_count);
+    status_.sample_span_ns =
+        samples_.empty() ? 0 :
+        samples_.back().monotonic_ns - samples_.front().monotonic_ns;
 
     if (samples_.size() >= 10 &&
         samples_.back().monotonic_ns - samples_.front().monotonic_ns >=
-            kMinimumRegressionSpanNs) {
+            config_.minimum_regression_span_ns) {
         fit();
     }
     return true;
@@ -304,7 +317,8 @@ bool ClockCalibration::fit()
                  finalScale, fittedUnixOrigin)) {
         return false;
     }
-    if (std::abs((finalScale - 1.0) * 1000000.0) > kMaximumDriftPpm) {
+    if (std::abs((finalScale - 1.0) * 1000000.0) >
+        config_.maximum_drift_ppm) {
         return false;
     }
 
@@ -325,6 +339,9 @@ bool ClockCalibration::fit()
     status_.median_residual_ns = median(std::move(finalResiduals));
     status_.sample_count = inliers.size();
     status_.drift_calibrated = true;
+    status_.sample_span_ns =
+        inliers.back().monotonic_ns - inliers.front().monotonic_ns;
+    status_.state = CalibrationState::Tracking;
     return true;
 }
 
@@ -350,77 +367,58 @@ void ClockCalibration::reset()
     samples_.clear();
     status_ = {};
     status_.rejected_samples = rejected;
+    status_.state = CalibrationState::WarmingUp;
     last_mac_ns_ = 0;
     last_unix_ns_ = 0;
     last_monotonic_ns_ = 0;
 }
 
-TimeAdjuster::TimeAdjuster(nfp_cpp *cpp, uint32_t macClockXpbAddress)
-    : cpp_(cpp), macClockXpbAddress_(macClockXpbAddress)
+TimeAdjuster::TimeAdjuster(nfp_cpp *cpp,
+                           const nfp_rtsym *macTimeSymbol,
+                           Config config)
+    : cpp_(cpp),
+      config_(std::move(config)),
+      calibration_(config_.calibration)
 {
     if (!cpp_) {
         throw std::invalid_argument("TimeAdjuster requires a valid CPP handle");
     }
-    const auto samples = collectSamples(kStartupSampleCount, true);
-    if (!calibration_.initialize(samples)) {
+    reader_ = std::make_unique<MacClockReader>(
+        cpp_, macTimeSymbol, config_.mac_time_symbol);
+    sampler_ = std::make_unique<ClockSampler>(
+        *reader_,
+        [] { return clockNanoseconds(CLOCK_REALTIME); },
+        [] { return clockNanoseconds(CLOCK_MONOTONIC_RAW); },
+        config_.maximum_sample_uncertainty_ns);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + config_.startup_timeout;
+    const auto samples = collectPublicationSamples(
+        config_.startup_sample_count, deadline, true);
+    if (!initializeFromPublicationSamples(samples)) {
+        mergeSamplerStatus();
+        status_cache_.state = CalibrationState::Degraded;
         throw std::runtime_error(
-            "Unable to calibrate SmartNIC clock: fewer than four "
-            "samples completed within 800 microseconds");
+            "Unable to calibrate SmartNIC clock from exported mac_time "
+            "publications before startup timeout");
     }
+    mergeSamplerStatus();
 }
 
-bool TimeAdjuster::readSample(TimeSample &sample) const
-{
-    const int64_t realtimeBefore = clockNanoseconds(CLOCK_REALTIME);
-    const int64_t monotonicBefore = clockNanoseconds(CLOCK_MONOTONIC_RAW);
-
-    uint32_t secondsBefore = 0;
-    uint32_t secondsAfter = 0;
-    uint32_t nanoseconds = 0;
-    int64_t macTimeNs = 0;
-    bool valid = false;
-    for (int attempt = 0; attempt < kRegisterReadRetries; ++attempt) {
-        if (nfp_xpb_readl(cpp_, macClockXpbAddress_ + 4,
-                          &secondsBefore) < 0 ||
-            nfp_xpb_readl(cpp_, macClockXpbAddress_,
-                          &nanoseconds) < 0 ||
-            nfp_xpb_readl(cpp_, macClockXpbAddress_ + 4,
-                          &secondsAfter) < 0) {
-            return false;
-        }
-        if (composeAtomicMacTime(secondsBefore, nanoseconds,
-                                 secondsAfter, macTimeNs)) {
-            valid = true;
-            break;
-        }
-    }
-
-    const int64_t monotonicAfter = clockNanoseconds(CLOCK_MONOTONIC_RAW);
-    const int64_t realtimeAfter = clockNanoseconds(CLOCK_REALTIME);
-    if (!valid || monotonicAfter < monotonicBefore) {
-        return false;
-    }
-
-    sample.mac_ns = macTimeNs;
-    sample.unix_ns = midpoint(realtimeBefore, realtimeAfter);
-    sample.monotonic_ns = midpoint(monotonicBefore, monotonicAfter);
-    sample.latency_ns = monotonicAfter - monotonicBefore;
-    return true;
-}
-
-std::vector<TimeSample> TimeAdjuster::collectSamples(
+std::vector<PublicationSample> TimeAdjuster::collectPublicationSamples(
     std::size_t count,
-    bool pauseBetweenSamples) const
+    std::chrono::steady_clock::time_point deadline,
+    bool pauseBetweenPolls)
 {
-    std::vector<TimeSample> samples;
+    std::vector<PublicationSample> samples;
     samples.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        TimeSample sample;
-        if (readSample(sample)) {
-            samples.push_back(sample);
+    while (samples.size() < count &&
+           std::chrono::steady_clock::now() < deadline) {
+        if (auto sample = sampler_->poll()) {
+            samples.push_back(*sample);
         }
-        if (pauseBetweenSamples && i + 1 < count) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (pauseBetweenPolls && samples.size() < count) {
+            std::this_thread::sleep_for(config_.startup_poll_interval);
         }
     }
     return samples;
@@ -428,16 +426,22 @@ std::vector<TimeSample> TimeAdjuster::collectSamples(
 
 bool TimeAdjuster::refresh()
 {
-    auto samples = collectSamples(kRefreshBurstSize, false);
+    auto samples = collectPublicationSamples(
+        config_.refresh_burst_size,
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(100),
+        false);
     if (samples.empty()) {
+        mergeSamplerStatus();
         return false;
     }
     const auto best = std::min_element(
         samples.begin(), samples.end(),
-        [](const TimeSample &left, const TimeSample &right) {
-            return left.latency_ns < right.latency_ns;
+        [](const PublicationSample &left, const PublicationSample &right) {
+            return left.uncertainty_ns < right.uncertainty_ns;
         });
-    return calibration_.addSample(*best);
+    const bool accepted = calibration_.addSample(toTimeSample(*best));
+    mergeSamplerStatus();
+    return accepted;
 }
 
 int64_t TimeAdjuster::toUnixNanoseconds(uint32_t sec, uint32_t nsec) const
@@ -453,5 +457,57 @@ int64_t TimeAdjuster::toUnixNanoseconds(uint32_t sec, uint32_t nsec) const
 
 CalibrationStatus TimeAdjuster::status() const
 {
-    return calibration_.status();
+    CalibrationStatus status = calibration_.status();
+    status.duplicate_states = status_cache_.duplicate_states;
+    status.invalid_observations = status_cache_.invalid_observations;
+    status.rejected_transitions = status_cache_.rejected_transitions;
+    status.host_clock_steps = status_cache_.host_clock_steps;
+    status.device_resets = status_cache_.device_resets;
+    status.latest_uncertainty_ns = status_cache_.latest_uncertainty_ns;
+    if (!status.valid && status_cache_.state == CalibrationState::Degraded) {
+        status.state = CalibrationState::Degraded;
+    }
+    return status;
+}
+
+TimeSample TimeAdjuster::toTimeSample(const PublicationSample &sample)
+{
+    TimeSample timeSample;
+    timeSample.mac_ns = sample.smartnic_ns;
+    timeSample.unix_ns = sample.host_realtime_ns;
+    timeSample.monotonic_ns = sample.host_monotonic_ns;
+    timeSample.latency_ns = sample.uncertainty_ns;
+    return timeSample;
+}
+
+bool TimeAdjuster::initializeFromPublicationSamples(
+    const std::vector<PublicationSample> &samples)
+{
+    std::vector<TimeSample> timeSamples;
+    timeSamples.reserve(samples.size());
+    for (const auto &sample : samples) {
+        status_cache_.latest_uncertainty_ns = sample.uncertainty_ns;
+        timeSamples.push_back(toTimeSample(sample));
+    }
+
+    std::sort(timeSamples.begin(), timeSamples.end(),
+              [](const TimeSample &left, const TimeSample &right) {
+                  return left.latency_ns < right.latency_ns;
+              });
+    if (timeSamples.size() > config_.startup_best_sample_count) {
+        timeSamples.resize(config_.startup_best_sample_count);
+    }
+
+    return calibration_.initialize(timeSamples);
+}
+
+void TimeAdjuster::mergeSamplerStatus()
+{
+    const ClockSamplerCounters counters = sampler_->counters();
+    status_cache_.accepted_samples = counters.accepted_transitions;
+    status_cache_.duplicate_states = counters.duplicate_states;
+    status_cache_.invalid_observations = counters.invalid_observations;
+    status_cache_.rejected_transitions = counters.rejected_transitions;
+    status_cache_.host_clock_steps = counters.host_clock_steps;
+    status_cache_.device_resets = counters.device_resets;
 }

@@ -435,7 +435,391 @@ Recommended initial values:
 
 Tune these from recorded data rather than treating them as final constants.
 
-## 9. Phase 6: Configuration and Observability
+## 9. Detailed Implementation Blueprint
+
+This section turns the phase plan into concrete code work. The implementation
+should be completed in small commits so the current direct-XPB calibration path
+can remain available until the exported-`mac_time` model passes shadow-mode
+validation.
+
+### 9.1 Target architecture
+
+Replace the direct NBI-register sampling in `TimeAdjuster::readSample()` with a
+read-only exported-symbol sampling pipeline:
+
+```text
+SmartNIC exported mac_time_state
+        |
+        v
+MacClockReader::readState()
+        |
+        v
+ClockSampler::poll()
+        |
+        v
+PublicationTransitionDetector
+        |
+        v
+ClockModel::addSample()
+        |
+        v
+TimeAdjuster::toUnixNanoseconds(flow timestamp)
+```
+
+Keep `ClockCalibration` or replace it with `ClockModel`, but the final
+responsibilities must be separated:
+
+- `MacClockReader` performs only CPP symbol resolution and state reads.
+- `ClockSampler` performs host-clock bracketing and latency accounting.
+- `PublicationTransitionDetector` converts repeated polls into publication
+  samples.
+- `ClockModel` fits, validates, and applies the affine model.
+- `TimeAdjuster` owns lifecycle, configuration, status, and flow conversion.
+
+The production conversion remains:
+
+```text
+converted_unix_ns = unix_origin_ns
+                  + round((smartnic_ns - smartnic_origin_ns) * scale)
+```
+
+where `smartnic_ns` is the raw `flow_data.start_time` or
+`flow_data.end_time` value composed from its seconds and nanoseconds fields.
+
+### 9.2 Data structures
+
+Add host-side structures that preserve all timing uncertainty instead of
+collapsing every read to one midpoint too early.
+
+```cpp
+struct HostClockBounds {
+    int64_t realtime_before_ns;
+    int64_t realtime_after_ns;
+    int64_t monotonic_before_ns;
+    int64_t monotonic_after_ns;
+};
+
+struct MacTimeStateHost {
+    uint32_t mac_time_s;
+    uint32_t mac_time_ns;
+    uint32_t me_time;
+    uint16_t conv_mult;
+    uint16_t conv_rshift;
+};
+
+struct MacStateObservation {
+    MacTimeStateHost state;
+    HostClockBounds bounds;
+    int64_t read_latency_ns;
+    bool valid;
+    std::string reject_reason;
+};
+
+struct PublicationSample {
+    int64_t smartnic_ns;
+    int64_t host_realtime_ns;
+    int64_t host_monotonic_ns;
+    int64_t uncertainty_ns;
+    int64_t transition_start_mono_ns;
+    int64_t transition_end_mono_ns;
+    uint32_t me_time;
+    uint16_t conv_mult;
+    uint16_t conv_rshift;
+};
+```
+
+Use `MacTimeStateHost` instead of reusing firmware headers directly in public
+interfaces. Add `static_assert(sizeof(MacTimeStateHost) == 16)` and offset
+assertions in the `.cpp` file that performs the raw read. Treat any host-side
+size or offset mismatch as a build failure.
+
+### 9.3 `MacClockReader`
+
+Create `include/MacClockReader.hpp` and `src/MacClockReader.cpp`.
+
+Constructor inputs:
+
+- `nfp_cpp *cpp`;
+- runtime symbol name, default `mac_time`;
+- optional expected structure size, default `sizeof(MacTimeStateHost)`.
+
+Startup behavior:
+
+1. resolve the symbol with the same runtime-symbol mechanism already used by
+   the application for other exported addresses;
+2. store the resolved address, domain, island, and CPP ID;
+3. log symbol name, address, domain, island, and structure size;
+4. fail construction if the symbol cannot be resolved.
+
+Read behavior:
+
+1. allocate an area with `nfp_cpp_area_alloc()`;
+2. acquire it with `nfp_cpp_area_acquire()`;
+3. read exactly `sizeof(MacTimeStateHost)` bytes with
+   `nfp_cpp_area_read()`;
+4. release and free the area on all paths;
+5. return a typed state only if the byte count is exact.
+
+Validation rules:
+
+- reject `mac_time_ns >= 1000000000`;
+- reject `conv_rshift >= 32`;
+- reject `conv_mult == 0`;
+- reject all-zero state after startup grace unless diagnostics prove it is a
+  valid firmware state;
+- reject backward `mac_time_s:mac_time_ns` transitions unless a reset is being
+  declared;
+- reject transitions whose `me_time` delta and MAC-time delta are impossible
+  for the configured ME frequency tolerance;
+- count every rejection by reason.
+
+If torn reads appear in diagnostics, add an optional stable-read mode:
+
+1. read state A;
+2. read state B immediately;
+3. accept if A and B are byte-identical;
+4. otherwise retry up to a small configured limit and record a torn-read
+   rejection if no stable pair is found.
+
+### 9.4 `ClockSampler`
+
+Create `ClockSampler` around an injected `MacClockReader` and injected clock
+function. The injected clock function allows deterministic tests without NFP
+hardware.
+
+Polling sequence:
+
+1. read `CLOCK_REALTIME`;
+2. read `CLOCK_MONOTONIC_RAW`;
+3. read `mac_time_state`;
+4. read `CLOCK_MONOTONIC_RAW`;
+5. read `CLOCK_REALTIME`;
+6. compute read latency from monotonic bounds;
+7. discard the observation if either host clock moves backward.
+
+Do not pair a stale `mac_time_state` with the current host midpoint as a
+calibration sample. Stale observations only update the interval in which the
+old state was still visible.
+
+### 9.5 Publication transition detector
+
+The detector owns the previous accepted observation and emits a
+`PublicationSample` only when the exported state changes.
+
+For repeated state:
+
+- update `last_seen_same_state_bounds`;
+- do not call `ClockModel::addSample()`;
+- update duplicate and stale counters.
+
+For changed state:
+
+1. validate that the new state is plausible relative to the previous state;
+2. build the publication interval from the last old-state observation and the
+   first new-state observation;
+3. set `host_realtime_ns` to the midpoint of the realtime interval;
+4. set `host_monotonic_ns` to the midpoint of the monotonic interval;
+5. set `uncertainty_ns` to the monotonic interval width plus the new read
+   latency;
+6. set `smartnic_ns` from `mac_time_s` and `mac_time_ns`;
+7. reject the transition if uncertainty exceeds the configured threshold;
+8. pass accepted transition samples to the model.
+
+Use the transition interval, not the single CPP-read midpoint, because the
+firmware state was published sometime after the last observation of the old
+state and before the first observation of the new state.
+
+### 9.6 Startup acquisition
+
+Startup should reach an `offset_only` model quickly but should not pretend that
+frequency drift is known.
+
+Algorithm:
+
+1. poll rapidly until either `startup_sample_count` publication samples are
+   accepted or `startup_timeout` expires;
+2. sort accepted samples by `uncertainty_ns`;
+3. keep the best `startup_best_sample_count`;
+4. set `smartnic_origin_ns` to the best sample's SmartNIC timestamp;
+5. set `unix_origin_ns` to
+   `smartnic_origin_ns + median(host_realtime_ns - smartnic_ns)`;
+6. set `scale = 1.0`;
+7. enter `offset_only`.
+
+If the startup timeout expires with too few publication samples, expose
+`degraded` status and either fail construction or continue without conversion
+according to the deployment setting. The recommended default is to fail fast in
+tools that require accurate timestamps and to continue degraded in diagnostics.
+
+### 9.7 Rolling affine fit
+
+The drift fit consumes only accepted `PublicationSample` values.
+
+Windowing:
+
+- keep samples in monotonic-time order;
+- remove samples older than `regression_window_ns`;
+- require `minimum_regression_span_ns`;
+- require `minimum_regression_samples`;
+- prefer low-uncertainty samples if the window grows above the configured
+  maximum sample count.
+
+Fit:
+
+1. choose origins near the first inlier in the current window;
+2. use `long double` centered arithmetic for `x = smartnic_ns - origin`;
+3. perform a first least-squares fit;
+4. compute residuals;
+5. compute median and median absolute deviation;
+6. reject outliers above `max(residual_floor_ns, mad_multiplier * mad)`;
+7. perform a second fit on inliers;
+8. calculate residual P50, P95, P99, and maximum;
+9. calculate drift as `(scale - 1.0) * 1e6` ppm.
+
+Candidate model checks:
+
+- sample span is sufficient;
+- inlier count is sufficient;
+- absolute drift is below configured ppm limit;
+- residual P99 is below configured threshold;
+- model does not create a large step at the latest converted timestamp;
+- model does not make converted time move backward for increasing SmartNIC
+  timestamps;
+- model age is newer than the last accepted model.
+
+If all checks pass, atomically publish the candidate and enter `tracking`. If
+any check fails, keep the last known-good model and increment the appropriate
+rejection counter.
+
+### 9.8 Host realtime step detection
+
+Track the relationship between `CLOCK_REALTIME` and `CLOCK_MONOTONIC_RAW` on
+every observation:
+
+```text
+host_step_error =
+    (realtime_now - realtime_previous)
+  - (monotonic_raw_now - monotonic_raw_previous)
+```
+
+If `abs(host_step_error)` exceeds `host_step_threshold_ns`:
+
+1. increment the host-step counter;
+2. mark the current calibration interval invalid;
+3. discard the Unix offset immediately;
+4. keep SmartNIC frequency history only if the step is a pure realtime offset
+   change and the SmartNIC state did not reset;
+5. reacquire startup offset samples;
+6. publish `offset_only` before returning to `tracking`.
+
+The validation report must exclude only the explicitly marked invalid interval,
+not arbitrary data around it.
+
+### 9.9 Device reset and rollback handling
+
+Declare a device discontinuity when any of these is observed:
+
+- `mac_time_s:mac_time_ns` moves backward beyond rollover rules;
+- `mac_time_s:mac_time_ns` jumps forward by more than the configured maximum
+  publication interval;
+- `conv_mult` or `conv_rshift` changes unexpectedly;
+- repeated reads return all-zero or invalid state after the device had been
+  valid;
+- flow timestamps move backward relative to previously converted flow
+  timestamps.
+
+On device discontinuity:
+
+1. increment reset counter;
+2. clear all publication samples;
+3. discard both offset and scale;
+4. enter `warming_up`;
+5. reacquire startup samples;
+6. publish a new model only after startup checks pass.
+
+Converted timestamps during reacquisition should be marked untrusted. If the
+application must continue outputting timestamps, include a status field or log
+record that identifies the degraded interval.
+
+### 9.10 Flow timestamp conversion integration
+
+Keep raw SmartNIC timestamps intact in `flow_data`. Convert only at the output
+boundary where the application currently presents Unix time.
+
+Implementation steps:
+
+1. compose raw SmartNIC nanoseconds from `start_time.sec`,
+   `start_time.nsec`, `end_time.sec`, and `end_time.nsec`;
+2. reject nanoseconds outside `[0, 1000000000)`;
+3. call `TimeAdjuster::toUnixNanoseconds()`;
+4. attach calibration status to diagnostic output;
+5. if calibration is degraded, either emit raw timestamps plus status or emit
+   converted timestamps explicitly marked degraded.
+
+Do not calibrate from packet receive time, sender time, or socket timestamp.
+Those are different events and would hide the SmartNIC clock behavior that this
+project needs to correct.
+
+### 9.11 Shadow mode
+
+Before enabling the new model by default, run both conversions:
+
+- old direct-XPB `TimeAdjuster` model;
+- new exported-`mac_time_state` publication-aware model.
+
+For every converted flow timestamp, log:
+
+- raw SmartNIC seconds and nanoseconds;
+- old converted Unix nanoseconds;
+- new converted Unix nanoseconds;
+- difference between old and new conversion;
+- new model state and drift ppm;
+- current sample uncertainty and residual summary.
+
+Shadow mode is complete when the new model is stable under idle load,
+representative traffic, and heavy CPP contention, and when the old/new
+difference is understood from the raw diagnostic samples.
+
+### 9.12 File-level change list
+
+Expected source changes:
+
+- `include/Time.hpp`: replace direct XPB-address constructor options with
+  exported-symbol and calibration configuration options; extend status fields.
+- `src/Time.cpp`: remove direct NBI register reads from production sampling;
+  keep the old path only behind a shadow-mode or diagnostic flag.
+- `include/MacClockReader.hpp` and `src/MacClockReader.cpp`: add exported
+  `mac_time_state` reader.
+- `include/ClockSampler.hpp` and `src/ClockSampler.cpp`: add host-clock
+  bracketing and transition sample construction.
+- `test/time_calibration_test.cpp`: update span expectations and add model
+  discontinuity tests.
+- `test/clock_sampler_test.cpp`: add deterministic publication-transition
+  tests with fake reader and fake clocks.
+- `setting.yaml`: add the configuration keys listed in Phase 6.
+- `CMakeLists.txt`: build the new implementation files, unit tests, and raw
+  diagnostic executable.
+
+Keep `mac_time.c`, `mac_time.h`, and `mac_time_user.c` unchanged except for
+comments in local documentation. Firmware behavior is an input to the host
+model, not part of the implementation surface.
+
+### 9.13 Implementation milestones
+
+1. Add model/status enums and configuration structures without changing
+   behavior.
+2. Add `MacClockReader` and a diagnostic tool that dumps raw observations.
+3. Add `ClockSampler` and publication-transition tests.
+4. Replace direct-XPB production samples with publication samples behind a
+   feature flag.
+5. Implement startup `offset_only` acquisition.
+6. Implement rolling `tracking` fit with robust rejection.
+7. Add host-step and device-reset recovery.
+8. Add shadow-mode logging.
+9. Enable the new path by default after one-hour and 24-hour qualification.
+10. Run and archive the one-month acceptance report.
+
+## 10. Phase 6: Configuration and Observability
 
 Add YAML settings for:
 
@@ -468,9 +852,9 @@ Expose at least:
 Rate-limit warnings. A rejected burst should not print once per second
 indefinitely without an aggregate count.
 
-## 10. Phase 7: Test Plan
+## 11. Phase 7: Test Plan
 
-### 10.1 Deterministic unit tests
+### 11.1 Deterministic unit tests
 
 Expand `test/time_calibration_test.cpp` to cover:
 
@@ -497,7 +881,7 @@ Resolve the current 3-second-versus-5-second test contradiction by making the
 required span an explicit test fixture input or by supplying samples that
 satisfy the production threshold.
 
-### 10.2 Property and simulation tests
+### 11.2 Property and simulation tests
 
 Generate long synthetic traces with:
 
@@ -516,7 +900,7 @@ Assert that:
 - converted time never moves backward for increasing SmartNIC timestamps
   unless a reset is explicitly reported.
 
-### 10.3 Hardware integration tests
+### 11.3 Hardware integration tests
 
 Run at least these scenarios:
 
@@ -538,7 +922,7 @@ quantile-summary format so the overall month-wide P99 can be calculated without
 keeping every sample in memory. Retain enough raw data around resets, clock
 steps, and error spikes for diagnosis.
 
-## 11. Phase 8: Integration and Rollout
+## 12. Phase 8: Integration and Rollout
 
 1. Add diagnostics without changing timestamp output.
 2. Collect baseline traces and identify the root cause.
@@ -554,7 +938,7 @@ steps, and error spikes for diagnosis.
 9. Remove the old path only after the new path has passed and rollback
    instructions are documented.
 
-## 12. Deliverables
+## 13. Deliverables
 
 - Updated `Plan.md` with definitions, clock-path diagram, and acceptance
   criteria.
@@ -569,7 +953,7 @@ steps, and error spikes for diagnosis.
 - Operational documentation covering startup, degraded mode, reset recovery,
   and expected drift/residual values.
 
-## 13. Recommended Execution Order
+## 14. Recommended Execution Order
 
 1. Fix the inconsistent existing calibration test.
 2. Add the read-only `mac_time_state` probe and transition diagnostics.

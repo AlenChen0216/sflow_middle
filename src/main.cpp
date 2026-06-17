@@ -311,10 +311,10 @@ int main(int argc, char *argv[])
     std::string flowDataSym = "__flow_data";
     std::string flowDataDupSym = "__flow_data_dup";
     std::string counterSemSym = "_cglobal_semaphores";
-    std::string counterDataSym = "__counter_data";
-    std::string curStateSym = "__cur_state";
-    std::string processingMeSym = "__processing_me";
-    uint32_t macClockXpb = TimeAdjuster::kDefaultMacClockXpbAddress;
+        std::string counterDataSym = "__counter_data";
+        std::string curStateSym = "__cur_state";
+        std::string processingMeSym = "__processing_me";
+        TimeAdjuster::Config timeConfig;
 
     try
     {
@@ -348,11 +348,35 @@ int main(int argc, char *argv[])
             curStateSym = config["cur_state_sym"].as<std::string>();
         if (config["processing_me_sym"])
             processingMeSym = config["processing_me_sym"].as<std::string>();
-        if (config["mac_clock_xpb"])
-            macClockXpb = config["mac_clock_xpb"].as<uint32_t>();
-        if (config["offset_time"] || config["time_sym"])
+        if (config["mac_time_symbol"])
+            timeConfig.mac_time_symbol = config["mac_time_symbol"].as<std::string>();
+        if (config["startup_sample_count"])
+            timeConfig.startup_sample_count = config["startup_sample_count"].as<std::size_t>();
+        if (config["startup_best_sample_count"])
+            timeConfig.startup_best_sample_count = config["startup_best_sample_count"].as<std::size_t>();
+        if (config["calibration_refresh_burst_size"])
+            timeConfig.refresh_burst_size = config["calibration_refresh_burst_size"].as<std::size_t>();
+        if (config["maximum_sample_uncertainty_ns"])
+            timeConfig.maximum_sample_uncertainty_ns = config["maximum_sample_uncertainty_ns"].as<int64_t>();
+        if (config["regression_window_ns"])
+            timeConfig.calibration.regression_window_ns = config["regression_window_ns"].as<int64_t>();
+        if (config["minimum_regression_span_ns"])
+            timeConfig.calibration.minimum_regression_span_ns = config["minimum_regression_span_ns"].as<int64_t>();
+        if (config["maximum_drift_ppm"])
+            timeConfig.calibration.maximum_drift_ppm = config["maximum_drift_ppm"].as<double>();
+        if (config["host_step_threshold_ns"])
+            timeConfig.calibration.host_step_threshold_ns = config["host_step_threshold_ns"].as<int64_t>();
+        if (config["model_step_threshold_ns"])
+            timeConfig.calibration.model_step_threshold_ns = config["model_step_threshold_ns"].as<int64_t>();
+        if (config["startup_timeout_ms"])
+            timeConfig.startup_timeout =
+                std::chrono::milliseconds(config["startup_timeout_ms"].as<int64_t>());
+        if (config["startup_poll_interval_us"])
+            timeConfig.startup_poll_interval =
+                std::chrono::microseconds(config["startup_poll_interval_us"].as<int64_t>());
+        if (config["offset_time"] || config["time_sym"] || config["mac_clock_xpb"])
             std::cerr << "Warning: offset_time and time_sym are deprecated "
-                         "and ignored; using the live NBI MAC clock\n";
+                         "and ignored; using exported mac_time calibration\n";
     }
     catch (const YAML::Exception &e)
     {
@@ -379,10 +403,11 @@ int main(int argc, char *argv[])
     const nfp_rtsym *symCounterData = dev->getSymbolData(counterDataSym.c_str());
     const nfp_rtsym *symCurState = dev->getSymbolData(curStateSym.c_str());
     const nfp_rtsym *symProcessingMe = dev->getSymbolData(processingMeSym.c_str());
+    const nfp_rtsym *symMacTime = dev->getSymbolData(timeConfig.mac_time_symbol.c_str());
 
     if (!symSem || !symSemDup || !symKey || !symKeyDup ||
         !symData || !symDataDup || !symCounterSem || !symCounterData ||
-        !symCurState || !symProcessingMe) {
+        !symCurState || !symProcessingMe || !symMacTime) {
         std::cerr << "Fatal: one or more required symbols not found on SmartNIC\n";
         if (!symSem)      std::cerr << "  missing: " << semSym << "\n";
         if (!symSemDup)   std::cerr << "  missing: " << semDupSym << "\n";
@@ -394,6 +419,7 @@ int main(int argc, char *argv[])
         if (!symCounterData) std::cerr << "  missing: " << counterDataSym << "\n";
         if (!symCurState) std::cerr << "  missing: " << curStateSym << "\n";
         if (!symProcessingMe) std::cerr << "  missing: " << processingMeSym << "\n";
+        if (!symMacTime) std::cerr << "  missing: " << timeConfig.mac_time_symbol << "\n";
         return 1;
     }
     std::cout<< "Successfully found all required symbols on SmartNIC\n";
@@ -407,8 +433,7 @@ int main(int argc, char *argv[])
     std::cout<< ""  << "  " << flowDataDupSym << ": addr=0x" << std::hex << symDataDup->addr << std::dec << ", domain=" << symDataDup->domain << "\n";
     std::cout<< ""  << "  " << counterSemSym << ": addr=0x" << std::hex << symCounterSem->addr << std::dec << ", domain=" << symCounterSem->domain << "\n";
     std::cout<< ""  << "  " << counterDataSym << ": addr=0x" << std::hex << symCounterData->addr << std::dec << ", domain=" << symCounterData->domain << "\n";
-    std::cout << "  MAC clock XPB: 0x" << std::hex << macClockXpb
-              << std::dec << "\n";
+    std::cout<< ""  << "  " << timeConfig.mac_time_symbol << ": addr=0x" << std::hex << symMacTime->addr << std::dec << ", domain=" << symMacTime->domain << "\n";
 
     SmartNicReader reader(dev->cpp(),
                           symCurState->addr, symCurState->domain,
@@ -433,7 +458,7 @@ int main(int argc, char *argv[])
     try
     {
         timeAdjuster = std::make_unique<TimeAdjuster>(
-            dev->cpp(), macClockXpb);
+            dev->cpp(), symMacTime, timeConfig);
     }
     catch (const std::exception &ex)
     {
