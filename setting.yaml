@@ -1,5 +1,5 @@
 devnum: 0
-runSecs: 20
+runSecs: 0 # 0 for infinite run, > 0 for finite run
 targetIp: "10.10.8.1"
 targetPort: 6343
 semaphore_sym: "_global_semaphores"
@@ -9,16 +9,18 @@ flow_key_dup_sym: "__flow_key_dup"
 flow_data_sym: "__flow_data"
 flow_data_dup_sym: "__flow_data_dup"
 counter_semaphore_sym: "_cglobal_semaphores"
+counter_semaphore_dup_sym: "_cglobal_semaphores_dup"
 counter_data_sym: "__counter_data"
+counter_data_dup_sym: "__counter_data_dup"
 cur_state_sym: "__cur_state"
 processing_me_sym: "__processing_me"
 mac_time_symbol: "_mac_time"
-startup_sample_count: 4
-startup_best_sample_count: 4
+startup_sample_count: 20
+startup_best_sample_count: 5
 startup_timeout_ms: 10000
-startup_poll_interval_us: 1000
+startup_poll_interval_us: 100
 calibration_refresh_burst_size: 8
-maximum_sample_uncertainty_ns: 5000000
+maximum_sample_uncertainty_ns: 2000000
 calibration_poll_interval_us: 1000
 regression_window_ns: 120000000000
 minimum_regression_span_ns: 5000000000

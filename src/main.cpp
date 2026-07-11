@@ -1,10 +1,13 @@
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -14,6 +17,7 @@
 #include <vector>
 #include <queue>
 #include <fstream>
+#include <pthread.h>
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 #include <yaml-cpp/yaml.h>
@@ -45,6 +49,72 @@ namespace
         std::condition_variable cv;
         std::queue<ExportData> queue;
     };
+
+    bool addShutdownSignal(sigset_t &signals, int signal)
+    {
+        if (sigaddset(&signals, signal) != 0)
+        {
+            std::cerr << "Failed to add shutdown signal " << signal
+                      << ": " << std::strerror(errno) << '\n';
+            return false;
+        }
+        return true;
+    }
+
+    bool setupShutdownSignals(sigset_t &signals)
+    {
+        if (sigemptyset(&signals) != 0)
+        {
+            std::cerr << "Failed to initialize shutdown signal set: "
+                      << std::strerror(errno) << '\n';
+            return false;
+        }
+
+        if (!addShutdownSignal(signals, SIGINT) ||
+            !addShutdownSignal(signals, SIGTERM) ||
+            !addShutdownSignal(signals, SIGHUP))
+        {
+            return false;
+        }
+
+        const int rc = pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+        if (rc != 0)
+        {
+            std::cerr << "Failed to block shutdown signals: "
+                      << std::strerror(rc) << '\n';
+            return false;
+        }
+        return true;
+    }
+
+    void shutdownSignalThread(sigset_t signals, SharedQueue &shared)
+    {
+        const timespec timeout{0, 200000000};
+
+        while (running.load())
+        {
+            siginfo_t info{};
+            const int signal = sigtimedwait(&signals, &info, &timeout);
+            if (signal == -1)
+            {
+                if (errno == EAGAIN || errno == EINTR)
+                {
+                    continue;
+                }
+                std::cerr << "Signal wait failed: " << std::strerror(errno)
+                          << '\n';
+                running.store(false);
+                shared.cv.notify_all();
+                return;
+            }
+
+            std::cerr << "Shutdown signal received (" << signal
+                      << "). Stopping...\n";
+            running.store(false);
+            shared.cv.notify_all();
+            return;
+        }
+    }
 
     void smartNicIoThread(SmartNicReader &reader,
                           CounterReader &counterReader,
@@ -157,6 +227,8 @@ namespace
             }
             
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000)); // Give the transmit thread a moment to finish processing
+        shared.cv.notify_all(); // Notify the transmit thread to exit if it's waiting
     }
 
     void transmitThread(SharedQueue &shared,
@@ -206,7 +278,7 @@ namespace
             });
         };
         
-        while (running.load())
+        while (true)
         {
             ExportData data;
             {
@@ -284,14 +356,6 @@ namespace
 
 } // namespace
 
-
-void signalHandler(int signum)
-{
-    
-    std::cout << "Interrupt signal received. Stopping...\n";
-    running.store(false);
-}
-
 int main(int argc, char *argv[])
 {
     unsigned int devnum = 0;
@@ -300,8 +364,11 @@ int main(int argc, char *argv[])
     uint16_t targetPort = 6343;
     std::unique_ptr<NFPDevice> dev;
 
-    signal(SIGINT,signalHandler);
-    signal(SIGTERM,signalHandler);
+    sigset_t shutdownSignals;
+    if (!setupShutdownSignals(shutdownSignals))
+    {
+        return 1;
+    }
 
     // Symbol names for the 4 registers (configurable via YAML)
     std::string semSym = "_global_semaphores";
@@ -311,10 +378,12 @@ int main(int argc, char *argv[])
     std::string flowDataSym = "__flow_data";
     std::string flowDataDupSym = "__flow_data_dup";
     std::string counterSemSym = "_cglobal_semaphores";
-        std::string counterDataSym = "__counter_data";
-        std::string curStateSym = "__cur_state";
-        std::string processingMeSym = "__processing_me";
-        TimeAdjuster::Config timeConfig;
+    std::string counterSemDupSym = "_cglobal_semaphores_dup";
+    std::string counterDataSym = "__counter_data";
+    std::string counterDataDupSym = "__counter_data_dup";
+    std::string curStateSym = "__cur_state";
+    std::string processingMeSym = "__processing_me";
+    TimeAdjuster::Config timeConfig;
 
     try
     {
@@ -342,8 +411,12 @@ int main(int argc, char *argv[])
             flowDataDupSym = config["flow_data_dup_sym"].as<std::string>();
         if (config["counter_semaphore_sym"])
             counterSemSym = config["counter_semaphore_sym"].as<std::string>();
+        if (config["counter_semaphore_dup_sym"])
+            counterSemDupSym = config["counter_semaphore_dup_sym"].as<std::string>();
         if (config["counter_data_sym"])
             counterDataSym = config["counter_data_sym"].as<std::string>();
+        if (config["counter_data_dup_sym"])
+            counterDataDupSym = config["counter_data_dup_sym"].as<std::string>();
         if (config["cur_state_sym"])
             curStateSym = config["cur_state_sym"].as<std::string>();
         if (config["processing_me_sym"])
@@ -400,13 +473,16 @@ int main(int argc, char *argv[])
     const nfp_rtsym *symData = dev->getSymbolData(flowDataSym.c_str());
     const nfp_rtsym *symDataDup = dev->getSymbolData(flowDataDupSym.c_str());
     const nfp_rtsym *symCounterSem = dev->getSymbolData(counterSemSym.c_str());
+    const nfp_rtsym *symCounterSemDup = dev->getSymbolData(counterSemDupSym.c_str());
     const nfp_rtsym *symCounterData = dev->getSymbolData(counterDataSym.c_str());
+    const nfp_rtsym *symCounterDataDup = dev->getSymbolData(counterDataDupSym.c_str());
     const nfp_rtsym *symCurState = dev->getSymbolData(curStateSym.c_str());
     const nfp_rtsym *symProcessingMe = dev->getSymbolData(processingMeSym.c_str());
     const nfp_rtsym *symMacTime = dev->getSymbolData(timeConfig.mac_time_symbol.c_str());
 
     if (!symSem || !symSemDup || !symKey || !symKeyDup ||
-        !symData || !symDataDup || !symCounterSem || !symCounterData ||
+        !symData || !symDataDup || !symCounterSem || !symCounterSemDup ||
+        !symCounterData || !symCounterDataDup ||
         !symCurState || !symProcessingMe || !symMacTime) {
         std::cerr << "Fatal: one or more required symbols not found on SmartNIC\n";
         if (!symSem)      std::cerr << "  missing: " << semSym << "\n";
@@ -416,7 +492,9 @@ int main(int argc, char *argv[])
         if (!symData)     std::cerr << "  missing: " << flowDataSym << "\n";
         if (!symDataDup)  std::cerr << "  missing: " << flowDataDupSym << "\n";
         if (!symCounterSem) std::cerr << "  missing: " << counterSemSym << "\n";
+        if (!symCounterSemDup) std::cerr << "  missing: " << counterSemDupSym << "\n";
         if (!symCounterData) std::cerr << "  missing: " << counterDataSym << "\n";
+        if (!symCounterDataDup) std::cerr << "  missing: " << counterDataDupSym << "\n";
         if (!symCurState) std::cerr << "  missing: " << curStateSym << "\n";
         if (!symProcessingMe) std::cerr << "  missing: " << processingMeSym << "\n";
         if (!symMacTime) std::cerr << "  missing: " << timeConfig.mac_time_symbol << "\n";
@@ -432,7 +510,9 @@ int main(int argc, char *argv[])
     std::cout<< ""  << "  " << flowDataSym << ": addr=0x" << std::hex << symData->addr << std::dec << ", domain=" << symData->domain << "\n";
     std::cout<< ""  << "  " << flowDataDupSym << ": addr=0x" << std::hex << symDataDup->addr << std::dec << ", domain=" << symDataDup->domain << "\n";
     std::cout<< ""  << "  " << counterSemSym << ": addr=0x" << std::hex << symCounterSem->addr << std::dec << ", domain=" << symCounterSem->domain << "\n";
+    std::cout<< ""  << "  " << counterSemDupSym << ": addr=0x" << std::hex << symCounterSemDup->addr << std::dec << ", domain=" << symCounterSemDup->domain << "\n";
     std::cout<< ""  << "  " << counterDataSym << ": addr=0x" << std::hex << symCounterData->addr << std::dec << ", domain=" << symCounterData->domain << "\n";
+    std::cout<< ""  << "  " << counterDataDupSym << ": addr=0x" << std::hex << symCounterDataDup->addr << std::dec << ", domain=" << symCounterDataDup->domain << "\n";
     std::cout<< ""  << "  " << timeConfig.mac_time_symbol << ": addr=0x" << std::hex << symMacTime->addr << std::dec << ", domain=" << symMacTime->domain << "\n";
 
     SmartNicReader reader(dev->cpp(),
@@ -446,14 +526,15 @@ int main(int argc, char *argv[])
                           BUFFER_SIZE);
 
     CounterReader counterReader(dev->cpp(),
-                                symCounterSem->addr,
-                                symCounterData->addr,
-                                symCounterSem->domain,
-                                symCounterData->domain,
+                                symCurState->addr, symCurState->domain,
+                                symProcessingMe->addr, symProcessingMe->domain,
+                                symCounterSem->addr, symCounterSemDup->addr,
+                                symCounterData->addr, symCounterDataDup->addr,
+                                symCounterSem->domain, symCounterData->domain,
+                                symCounterSemDup->domain, symCounterDataDup->domain,
                                 BUFFER_SIZE2);
 
     SharedQueue shared;
-
     std::unique_ptr<TimeAdjuster> timeAdjuster;
     try
     {
@@ -482,11 +563,41 @@ int main(int argc, char *argv[])
                          targetIp,
                          targetPort);
 
-    std::this_thread::sleep_for(std::chrono::seconds(runSecs));
+    std::thread signalThread(shutdownSignalThread,
+                             shutdownSignals,
+                             std::ref(shared));
+                         
+    try
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(runSecs);
+        if(runSecs > 0)
+        {
+            while (running.load() && std::chrono::steady_clock::now() < deadline)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }else{
+            
+            while (running.load())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        }
+        
+    }
+    catch(const std::exception &ex)
+    {
+        std::cerr << "Error during sleep: " << ex.what() << '\n';
+    }
 
     running.store(false);
     shared.cv.notify_all();
 
+    if (signalThread.joinable())
+    {
+        signalThread.join();
+    }
     if (nicThread.joinable())
     {
         nicThread.join();
