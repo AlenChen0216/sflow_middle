@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,6 +19,7 @@
 #include <pthread.h>
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
 
 #include "../include/Time.hpp"
@@ -54,8 +54,8 @@ namespace
     {
         if (sigaddset(&signals, signal) != 0)
         {
-            std::cerr << "Failed to add shutdown signal " << signal
-                      << ": " << std::strerror(errno) << '\n';
+            SPDLOG_ERROR("Failed to add shutdown signal {}: {}",
+                         signal, std::strerror(errno));
             return false;
         }
         return true;
@@ -65,8 +65,8 @@ namespace
     {
         if (sigemptyset(&signals) != 0)
         {
-            std::cerr << "Failed to initialize shutdown signal set: "
-                      << std::strerror(errno) << '\n';
+            SPDLOG_ERROR("Failed to initialize shutdown signal set: {}",
+                         std::strerror(errno));
             return false;
         }
 
@@ -80,8 +80,8 @@ namespace
         const int rc = pthread_sigmask(SIG_BLOCK, &signals, nullptr);
         if (rc != 0)
         {
-            std::cerr << "Failed to block shutdown signals: "
-                      << std::strerror(rc) << '\n';
+            SPDLOG_ERROR("Failed to block shutdown signals: {}",
+                         std::strerror(rc));
             return false;
         }
         return true;
@@ -101,15 +101,13 @@ namespace
                 {
                     continue;
                 }
-                std::cerr << "Signal wait failed: " << std::strerror(errno)
-                          << '\n';
+                SPDLOG_ERROR("Signal wait failed: {}", std::strerror(errno));
                 running.store(false);
                 shared.cv.notify_all();
                 return;
             }
 
-            std::cerr << "Shutdown signal received (" << signal
-                      << "). Stopping...\n";
+            SPDLOG_INFO("Shutdown signal received ({}). Stopping...", signal);
             running.store(false);
             shared.cv.notify_all();
             return;
@@ -136,25 +134,25 @@ namespace
             std::vector<flow_data> flowEntries = reader.readFlowData();
             std::vector<counter_data> counterEntries = counterReader.readCounterData();
             if (!timeAdjuster.refresh()) {
-                std::cerr << "Warning: SmartNIC clock refresh sample rejected; "
-                             "continuing with the previous calibration\n";
+                SPDLOG_WARN("SmartNIC clock refresh sample rejected; "
+                            "continuing with the previous calibration");
             }
             const CalibrationStatus calibration = timeAdjuster.status();
             if (!calibration.drift_calibrated) {
                 driftCalibrationReported = false;
             } else if (!driftCalibrationReported) {
-                std::cout << "SmartNIC clock drift calibrated: "
-                          << (calibration.scale - 1.0) * 1000000.0
-                          << " ppm, median residual "
-                          << calibration.median_residual_ns / 1000
-                          << " us, samples " << calibration.sample_count
-                          << "\n";
+                SPDLOG_INFO("SmartNIC clock drift calibrated: {} ppm, "
+                            "median residual {} us, samples {}",
+                            (calibration.scale - 1.0) * 1000000.0,
+                            calibration.median_residual_ns / 1000,
+                            calibration.sample_count);
                 driftCalibrationReported = true;
             }
 
             auto end = std::chrono::steady_clock::now();
             std::chrono::duration<double> elapsed = end - start;
-            std::cout << "readFlowData() took " << elapsed.count() << " seconds and returned " << flowEntries.size() << " entries\n";
+            SPDLOG_INFO("readFlowData() took {} seconds and returned {} entries",
+                        elapsed.count(), flowEntries.size());
             
             std::map<Tuple, FlowRecord> localFlowMap;
             std::map<CounterAgent, CounterRecord> localCounterMap;
@@ -232,7 +230,7 @@ namespace
     }
 
     void transmitThread(SharedQueue &shared,
-                        const std::string &target_ip, uint16_t target_port)
+                        const std::string &target_ip, uint16_t target_port, bool debug = false)
     {
         namespace asio = boost::asio;
         using udp = asio::ip::udp;
@@ -250,15 +248,14 @@ namespace
         }
         catch (const boost::system::system_error &error)
         {
-            std::cerr << "Failed to initialize UDP sender: "
-                      << error.what() << '\n';
+            SPDLOG_ERROR("Failed to initialize UDP sender: {}", error.what());
             return;
         }
 
         std::fstream testFile;
         testFile.open("test_output.json", std::ios::out);
         if( !testFile.is_open() ) {
-            std::cerr << "Failed to open test_output.json for writing.\n";
+            SPDLOG_ERROR("Failed to open test_output.json for writing");
             return;
         }
 
@@ -271,8 +268,7 @@ namespace
                     [data](const boost::system::error_code &error, std::size_t) {
                         if (error)
                         {
-                            std::cerr << "UDP send failed: "
-                                      << error.message() << '\n';
+                            SPDLOG_ERROR("UDP send failed: {}", error.message());
                         }
                     });
             });
@@ -347,7 +343,8 @@ namespace
             for_record["counterMap"] = for_record_counterArray;
             std::string payload = for_record.dump();
             // std::string payload = for_record.dump();
-            testFile << payload << std::endl;
+            if(debug)
+                testFile << payload << std::endl;
         }
         work.reset();
         ioThread.join();
@@ -358,6 +355,9 @@ namespace
 
 int main(int argc, char *argv[])
 {
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
+    spdlog::flush_on(spdlog::level::warn);
+
     unsigned int devnum = 0;
     int runSecs = 14;
     std::string targetIp = "192.168.1.4";
@@ -371,6 +371,7 @@ int main(int argc, char *argv[])
     }
 
     // Symbol names for the 4 registers (configurable via YAML)
+    bool debug = false;
     std::string semSym = "_global_semaphores";
     std::string semDupSym = "_global_semaphores_dup";
     std::string flowKeySym = "__flow_key";
@@ -388,7 +389,8 @@ int main(int argc, char *argv[])
     try
     {
         YAML::Node config = argc > 1 ? YAML::LoadFile(argv[1]) : YAML::LoadFile("setting.yaml");
-
+        if (config["debug"])
+            debug = config["debug"].as<bool>();
         if (config["devnum"])
             devnum = config["devnum"].as<unsigned int>();
         if (config["runSecs"])
@@ -448,12 +450,12 @@ int main(int argc, char *argv[])
             timeConfig.startup_poll_interval =
                 std::chrono::microseconds(config["startup_poll_interval_us"].as<int64_t>());
         if (config["offset_time"] || config["time_sym"] || config["mac_clock_xpb"])
-            std::cerr << "Warning: offset_time and time_sym are deprecated "
-                         "and ignored; using exported mac_time calibration\n";
+            SPDLOG_WARN("offset_time and time_sym are deprecated and ignored; "
+                        "using exported mac_time calibration");
     }
     catch (const YAML::Exception &e)
     {
-        std::cerr << "YAML parsing error or setting.yaml not found: " << e.what() << "\n";
+        SPDLOG_ERROR("YAML parsing error or setting.yaml not found: {}", e.what());
         // return 1;
     }
     try
@@ -462,7 +464,7 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception &ex)
     {
-        std::cerr << "Fatal: " << ex.what() << '\n';
+        SPDLOG_CRITICAL("Fatal: {}", ex.what());
         return 1;
     }
     // Look up the 4 rtsym symbols
@@ -484,36 +486,36 @@ int main(int argc, char *argv[])
         !symData || !symDataDup || !symCounterSem || !symCounterSemDup ||
         !symCounterData || !symCounterDataDup ||
         !symCurState || !symProcessingMe || !symMacTime) {
-        std::cerr << "Fatal: one or more required symbols not found on SmartNIC\n";
-        if (!symSem)      std::cerr << "  missing: " << semSym << "\n";
-        if (!symSemDup)   std::cerr << "  missing: " << semDupSym << "\n";
-        if (!symKey)      std::cerr << "  missing: " << flowKeySym << "\n";
-        if (!symKeyDup)   std::cerr << "  missing: " << flowKeyDupSym << "\n";
-        if (!symData)     std::cerr << "  missing: " << flowDataSym << "\n";
-        if (!symDataDup)  std::cerr << "  missing: " << flowDataDupSym << "\n";
-        if (!symCounterSem) std::cerr << "  missing: " << counterSemSym << "\n";
-        if (!symCounterSemDup) std::cerr << "  missing: " << counterSemDupSym << "\n";
-        if (!symCounterData) std::cerr << "  missing: " << counterDataSym << "\n";
-        if (!symCounterDataDup) std::cerr << "  missing: " << counterDataDupSym << "\n";
-        if (!symCurState) std::cerr << "  missing: " << curStateSym << "\n";
-        if (!symProcessingMe) std::cerr << "  missing: " << processingMeSym << "\n";
-        if (!symMacTime) std::cerr << "  missing: " << timeConfig.mac_time_symbol << "\n";
+        SPDLOG_CRITICAL("Fatal: one or more required symbols not found on SmartNIC");
+        if (!symSem) SPDLOG_CRITICAL("  missing: {}", semSym);
+        if (!symSemDup) SPDLOG_CRITICAL("  missing: {}", semDupSym);
+        if (!symKey) SPDLOG_CRITICAL("  missing: {}", flowKeySym);
+        if (!symKeyDup) SPDLOG_CRITICAL("  missing: {}", flowKeyDupSym);
+        if (!symData) SPDLOG_CRITICAL("  missing: {}", flowDataSym);
+        if (!symDataDup) SPDLOG_CRITICAL("  missing: {}", flowDataDupSym);
+        if (!symCounterSem) SPDLOG_CRITICAL("  missing: {}", counterSemSym);
+        if (!symCounterSemDup) SPDLOG_CRITICAL("  missing: {}", counterSemDupSym);
+        if (!symCounterData) SPDLOG_CRITICAL("  missing: {}", counterDataSym);
+        if (!symCounterDataDup) SPDLOG_CRITICAL("  missing: {}", counterDataDupSym);
+        if (!symCurState) SPDLOG_CRITICAL("  missing: {}", curStateSym);
+        if (!symProcessingMe) SPDLOG_CRITICAL("  missing: {}", processingMeSym);
+        if (!symMacTime) SPDLOG_CRITICAL("  missing: {}", timeConfig.mac_time_symbol);
         return 1;
     }
-    std::cout<< "Successfully found all required symbols on SmartNIC\n";
-    std::cout<< ""  << "  " << curStateSym << ": addr=0x" << std::hex << symCurState->addr << std::dec << ", domain=" << symCurState->domain << "\n";
-    std::cout<< ""  << "  " << processingMeSym << ": addr=0x" << std::hex << symProcessingMe->addr << std::dec << ", domain=" << symProcessingMe->domain << "\n";
-    std::cout<< ""  << "  " << semSym << ": addr=0x" << std::hex << symSem->addr << std::dec << ", domain=" << symSem->domain << "\n";
-    std::cout<< ""  << "  " << semDupSym << ": addr=0x" << std::hex << symSemDup->addr << std::dec << ", domain=" << symSemDup->domain << "\n";
-    std::cout<< ""  << "  " << flowKeySym << ": addr=0x" << std::hex << symKey->addr << std::dec << ", domain=" << symKey->domain << "\n";
-    std::cout<< ""  << "  " << flowKeyDupSym << ": addr=0x" << std::hex << symKeyDup->addr << std::dec << ", domain=" << symKeyDup->domain << "\n";
-    std::cout<< ""  << "  " << flowDataSym << ": addr=0x" << std::hex << symData->addr << std::dec << ", domain=" << symData->domain << "\n";
-    std::cout<< ""  << "  " << flowDataDupSym << ": addr=0x" << std::hex << symDataDup->addr << std::dec << ", domain=" << symDataDup->domain << "\n";
-    std::cout<< ""  << "  " << counterSemSym << ": addr=0x" << std::hex << symCounterSem->addr << std::dec << ", domain=" << symCounterSem->domain << "\n";
-    std::cout<< ""  << "  " << counterSemDupSym << ": addr=0x" << std::hex << symCounterSemDup->addr << std::dec << ", domain=" << symCounterSemDup->domain << "\n";
-    std::cout<< ""  << "  " << counterDataSym << ": addr=0x" << std::hex << symCounterData->addr << std::dec << ", domain=" << symCounterData->domain << "\n";
-    std::cout<< ""  << "  " << counterDataDupSym << ": addr=0x" << std::hex << symCounterDataDup->addr << std::dec << ", domain=" << symCounterDataDup->domain << "\n";
-    std::cout<< ""  << "  " << timeConfig.mac_time_symbol << ": addr=0x" << std::hex << symMacTime->addr << std::dec << ", domain=" << symMacTime->domain << "\n";
+    SPDLOG_INFO("Successfully found all required symbols on SmartNIC");
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", curStateSym, symCurState->addr, symCurState->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", processingMeSym, symProcessingMe->addr, symProcessingMe->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", semSym, symSem->addr, symSem->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", semDupSym, symSemDup->addr, symSemDup->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", flowKeySym, symKey->addr, symKey->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", flowKeyDupSym, symKeyDup->addr, symKeyDup->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", flowDataSym, symData->addr, symData->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", flowDataDupSym, symDataDup->addr, symDataDup->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", counterSemSym, symCounterSem->addr, symCounterSem->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", counterSemDupSym, symCounterSemDup->addr, symCounterSemDup->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", counterDataSym, symCounterData->addr, symCounterData->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", counterDataDupSym, symCounterDataDup->addr, symCounterDataDup->domain);
+    SPDLOG_INFO("  {}: addr=0x{:x}, domain={}", timeConfig.mac_time_symbol, symMacTime->addr, symMacTime->domain);
 
     SmartNicReader reader(dev->cpp(),
                           symCurState->addr, symCurState->domain,
@@ -543,13 +545,13 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception &ex)
     {
-        std::cerr << "Fatal: " << ex.what() << '\n';
+        SPDLOG_CRITICAL("Fatal: {}", ex.what());
         return 1;
     }
     const CalibrationStatus initialCalibration = timeAdjuster->status();
-    std::cout << "SmartNIC clock calibrated: minimum latency "
-              << initialCalibration.minimum_latency_ns / 1000
-              << " us, samples " << initialCalibration.sample_count << "\n";
+    SPDLOG_INFO("SmartNIC clock calibrated: minimum latency {} us, samples {}",
+                initialCalibration.minimum_latency_ns / 1000,
+                initialCalibration.sample_count);
 
     std::thread nicThread(smartNicIoThread,
                           std::ref(reader),
@@ -561,7 +563,8 @@ int main(int argc, char *argv[])
     std::thread txThread(transmitThread,
                          std::ref(shared),
                          targetIp,
-                         targetPort);
+                         targetPort,
+                         debug);
 
     std::thread signalThread(shutdownSignalThread,
                              shutdownSignals,
@@ -588,7 +591,7 @@ int main(int argc, char *argv[])
     }
     catch(const std::exception &ex)
     {
-        std::cerr << "Error during sleep: " << ex.what() << '\n';
+        SPDLOG_ERROR("Error during sleep: {}", ex.what());
     }
 
     running.store(false);

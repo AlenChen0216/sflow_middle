@@ -2,9 +2,10 @@
 
 #include <cstddef>
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
 #include <vector>
+
+#include <spdlog/spdlog.h>
 
 namespace
 {
@@ -71,14 +72,10 @@ MacClockReader::MacClockReader(nfp_cpp *cpp,
         throw std::runtime_error("mac_time symbol is too small to contain mandatory fields");
     }
 
-    std::cout << "SmartNIC exported clock symbol " << symbolName_
-              << ": addr=0x" << std::hex << address_
-              << std::dec << ", domain=" << domain_
-              << ", target=" << target_
-              << ", type=" << type_
-              << ", size=" << symbolSize_
-              << ", host_size=" << expectedSize_
-              << "\n";
+    SPDLOG_INFO("SmartNIC exported clock symbol {}: addr=0x{:x}, domain={}, "
+                "target={}, type={}, size={}, host_size={}",
+                symbolName_, address_, domain_, target_, type_, symbolSize_,
+                expectedSize_);
 }
 
 MacStateObservation MacClockReader::readState()

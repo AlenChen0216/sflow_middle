@@ -10,6 +10,9 @@
 #include <thread>
 #include <time.h>
 
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+
 namespace
 {
 int64_t clockNanoseconds(clockid_t clockId)
@@ -25,6 +28,10 @@ int64_t clockNanoseconds(clockid_t clockId)
 
 int main(int argc, char *argv[])
 {
+    auto logger = spdlog::stderr_color_mt("raw_clock_probe");
+    logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
+    spdlog::set_default_logger(std::move(logger));
+
     const unsigned int devnum = argc > 1
         ? static_cast<unsigned int>(std::stoul(argv[1]))
         : 0;
@@ -38,7 +45,7 @@ int main(int argc, char *argv[])
         const nfp_rtsym *symbol =
             device.getSymbolData(symbolName.c_str());
         if (!symbol) {
-            std::cerr << "Symbol not found: " << symbolName << "\n";
+            SPDLOG_ERROR("Symbol not found: {}", symbolName);
             return EXIT_FAILURE;
         }
 
@@ -90,10 +97,9 @@ int main(int argc, char *argv[])
             std::this_thread::sleep_for(interval);
         }
     } catch (const std::exception &ex) {
-        std::cerr << "raw_clock_probe failed: " << ex.what() << "\n";
+        SPDLOG_ERROR("raw_clock_probe failed: {}", ex.what());
         return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;
 }
-

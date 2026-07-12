@@ -78,7 +78,7 @@ target_include_directories(time_calibration_test PRIVATE
 	include/
 	"${NETRONOME_INCLUDE_DIR}"
 )
-target_link_libraries(time_calibration_test PRIVATE ${NETRONOME_LIBS})
+target_link_libraries(time_calibration_test PRIVATE spdlog::spdlog ${NETRONOME_LIBS})
 set_target_properties(time_calibration_test PROPERTIES
 	BUILD_RPATH "${NETRONOME_ROOT}/lib"
 	INSTALL_RPATH "${NETRONOME_ROOT}/lib"
@@ -108,7 +108,7 @@ target_include_directories(raw_clock_probe PRIVATE
 	include/
 	"${NETRONOME_INCLUDE_DIR}"
 )
-target_link_libraries(raw_clock_probe PRIVATE ${NETRONOME_LIBS})
+target_link_libraries(raw_clock_probe PRIVATE spdlog::spdlog ${NETRONOME_LIBS})
 set_target_properties(raw_clock_probe PROPERTIES
 	BUILD_RPATH "${NETRONOME_ROOT}/lib"
 	INSTALL_RPATH "${NETRONOME_ROOT}/lib"

@@ -1,3 +1,4 @@
+debug: true # true -> to log the aggregated data to "test_output.json" file. false -> do not log.
 devnum: 0
 runSecs: 0 # 0 for infinite run, > 0 for finite run
 targetIp: "10.10.8.1"
