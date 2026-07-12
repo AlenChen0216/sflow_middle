@@ -1,4 +1,5 @@
 /build
 /src/alen.code-workspace
+/logs
 test_output.json
 nohup.out

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include <boost/asio.hpp>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <yaml-cpp/yaml.h>
 
 #include "../include/Time.hpp"
@@ -35,6 +37,31 @@ std::atomic<bool> running{true};
 
 namespace
 {
+
+    constexpr std::size_t kMaxLogFileSize = 10 * 1024 * 1024;
+    constexpr std::size_t kMaxRotatedLogFiles = 1;
+    constexpr const char *kLogFile = "logs/sflow_middle.log";
+    constexpr const char *kLogPattern = "[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v";
+
+    void configureLogging()
+    {
+        spdlog::set_pattern(kLogPattern);
+        spdlog::flush_on(spdlog::level::warn);
+
+        try
+        {
+            std::filesystem::create_directories("logs");
+            auto fileSink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+                kLogFile, kMaxLogFileSize, kMaxRotatedLogFiles);
+            fileSink->set_pattern(kLogPattern);
+            spdlog::default_logger()->sinks().push_back(std::move(fileSink));
+        }
+        catch (const std::exception &ex)
+        {
+            SPDLOG_ERROR("Failed to configure rotating log file '{}': {}",
+                         kLogFile, ex.what());
+        }
+    }
 
     struct ExportData
     {
@@ -355,8 +382,7 @@ namespace
 
 int main(int argc, char *argv[])
 {
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] %v");
-    spdlog::flush_on(spdlog::level::warn);
+    configureLogging();
 
     unsigned int devnum = 0;
     int runSecs = 14;
