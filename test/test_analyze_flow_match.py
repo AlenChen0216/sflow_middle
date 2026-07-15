@@ -83,9 +83,28 @@ class FlowMatchTests(unittest.TestCase):
         self.assertEqual(len(output_records), 2)
         self.assertEqual(len(ground_records), 2)
 
+    def test_device_tagged_records_are_accepted_and_aggregated(self):
+        output_path = self.write_jsonl(
+            "output.json",
+            [
+                {"devnum": 0, "flowMap": [output_flow()]},
+                {"devnum": 1, "flowMap": [output_flow()]},
+            ],
+        )
+        ground_path = self.write_jsonl(
+            "ground.json", [{"flowinfo": [ground_flow(2400, 600)]}]
+        )
+
+        result = analyzer.compare_totals(
+            analyzer.aggregate_output(output_path),
+            analyzer.aggregate_ground_truth(ground_path),
+            tolerance=0,
+        )
+        self.assertTrue(result.matches)
+
     def test_ip_conversion_sampling_and_agent_average(self):
         output_path = self.write_jsonl(
-            "output.json", [{"flowMap": [output_flow()]}], blank_line=True
+            "output.json", [{"devnum": 0, "flowMap": [output_flow()]}], blank_line=True
         )
         ground_path = self.write_jsonl(
             "ground.json", [{"flowinfo": [ground_flow()]}]
@@ -104,7 +123,8 @@ class FlowMatchTests(unittest.TestCase):
         first = output_flow()
         second = output_flow()
         output_path = self.write_jsonl(
-            "output.json", [{"flowMap": [first]}, {"flowMap": [second]}]
+            "output.json",
+            [{"devnum": 0, "flowMap": [first]}, {"devnum": 1, "flowMap": [second]}],
         )
         ground_path = self.write_jsonl(
             "ground.json", [{"flowinfo": [ground_flow(2400, 600)]}]
@@ -174,7 +194,7 @@ class FlowMatchTests(unittest.TestCase):
 
     def test_cli_match_and_mismatch_exit_codes(self):
         output_path = self.write_jsonl(
-            "output.json", [{"flowMap": [output_flow()]}]
+            "output.json", [{"devnum": 1, "flowMap": [output_flow()]}]
         )
         matching_ground = self.write_jsonl(
             "matching.json", [{"flowinfo": [ground_flow()]}]

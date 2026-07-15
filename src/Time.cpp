@@ -375,7 +375,8 @@ void ClockCalibration::reset()
 
 TimeAdjuster::TimeAdjuster(nfp_cpp *cpp,
                            const nfp_rtsym *macTimeSymbol,
-                           Config config)
+                           Config config,
+                           std::optional<unsigned int> devnum)
     : cpp_(cpp),
       config_(std::move(config)),
       calibration_(config_.calibration)
@@ -384,7 +385,8 @@ TimeAdjuster::TimeAdjuster(nfp_cpp *cpp,
         throw std::invalid_argument("TimeAdjuster requires a valid CPP handle");
     }
     reader_ = std::make_unique<MacClockReader>(
-        cpp_, macTimeSymbol, config_.mac_time_symbol);
+        cpp_, macTimeSymbol, config_.mac_time_symbol,
+        sizeof(MacTimeStateHost), devnum);
     sampler_ = std::make_unique<ClockSampler>(
         *reader_,
         [] { return clockNanoseconds(CLOCK_REALTIME); },

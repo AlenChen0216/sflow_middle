@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 
 extern "C" {
@@ -27,7 +28,8 @@ public:
     MacClockReader(nfp_cpp *cpp,
                    const nfp_rtsym *symbol,
                    std::string symbolName = "mac_time",
-                   std::size_t expectedSize = sizeof(MacTimeStateHost));
+                   std::size_t expectedSize = sizeof(MacTimeStateHost),
+                   std::optional<unsigned int> devnum = std::nullopt);
 
     MacStateObservation readState() override;
     MacClockReaderStatus status() const;
@@ -51,9 +53,9 @@ private:
     int target_;
     int type_;
     std::size_t expectedSize_;
+    std::optional<unsigned int> devnum_;
     uint32_t cppId_;
     bool hasLastState_ = false;
     MacTimeStateHost lastState_;
     MacClockReaderStatus status_;
 };
-

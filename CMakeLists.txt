@@ -98,6 +98,41 @@ target_compile_options(clock_sampler_test PRIVATE
 )
 add_test(NAME clock_sampler COMMAND clock_sampler_test)
 
+add_executable(app_config_test
+
+	test/app_config_test.cpp
+	src/AppConfig.cpp
+)
+target_include_directories(app_config_test PRIVATE
+	include/
+	"${NETRONOME_INCLUDE_DIR}"
+)
+target_link_libraries(app_config_test PRIVATE
+	yaml-cpp
+	spdlog::spdlog
+	fmt::fmt
+	Boost::system
+)
+target_compile_options(app_config_test PRIVATE
+	-Wall -Wextra -fdiagnostics-color=always -O2
+)
+add_test(NAME app_config COMMAND app_config_test)
+
+add_executable(export_pipeline_test
+
+	test/export_pipeline_test.cpp
+	src/ExportPipeline.cpp
+)
+target_include_directories(export_pipeline_test PRIVATE
+	include/
+	"${NETRONOME_INCLUDE_DIR}"
+)
+target_link_libraries(export_pipeline_test PRIVATE Threads::Threads nlohmann_json::nlohmann_json)
+target_compile_options(export_pipeline_test PRIVATE
+	-Wall -Wextra -fdiagnostics-color=always -O2
+)
+add_test(NAME export_pipeline COMMAND export_pipeline_test)
+
 add_executable(raw_clock_probe
 	tools/raw_clock_probe.cpp
 	src/Device.cpp

@@ -1,10 +1,15 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <map>
 #include <tuple>
 #include <vector>
+
+// Firmware counter-buffer layout.  Keep this as a typed constant so runtime
+// symbol validation and reader construction use the same slot count.
+inline constexpr std::size_t kCounterSlotCount = 2048;
 
 extern "C"
 {

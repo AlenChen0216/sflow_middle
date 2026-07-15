@@ -48,7 +48,8 @@ static_assert(offsetof(MacTimeStateHost, conv_rshift) == 16,
 MacClockReader::MacClockReader(nfp_cpp *cpp,
                                const nfp_rtsym *symbol,
                                std::string symbolName,
-                               std::size_t expectedSize)
+                               std::size_t expectedSize,
+                               std::optional<unsigned int> devnum)
     : cpp_(cpp),
       symbolName_(std::move(symbolName)),
       address_(symbol ? symbol->addr : 0),
@@ -57,6 +58,7 @@ MacClockReader::MacClockReader(nfp_cpp *cpp,
       target_(symbol ? symbol->target : 0),
       type_(symbol ? symbol->type : 0),
       expectedSize_(expectedSize),
+      devnum_(devnum),
       cppId_(NFP_CPP_ISLAND_ID(kCppTargetMem, kCppActionReadWrite, 0, domain_))
 {
     if (!cpp_) {
@@ -72,10 +74,18 @@ MacClockReader::MacClockReader(nfp_cpp *cpp,
         throw std::runtime_error("mac_time symbol is too small to contain mandatory fields");
     }
 
-    SPDLOG_INFO("SmartNIC exported clock symbol {}: addr=0x{:x}, domain={}, "
-                "target={}, type={}, size={}, host_size={}",
-                symbolName_, address_, domain_, target_, type_, symbolSize_,
-                expectedSize_);
+    if (devnum_) {
+        SPDLOG_INFO("[devnum={}] SmartNIC exported clock symbol {}: addr=0x{:x}, "
+                    "domain={}, target={}, type={}, size={}, host_size={}",
+                    *devnum_, symbolName_, address_, domain_, target_, type_,
+                    symbolSize_, expectedSize_);
+    } else {
+        SPDLOG_INFO("[devnum=unknown] SmartNIC exported clock symbol {}: "
+                    "addr=0x{:x}, domain={}, target={}, type={}, size={}, "
+                    "host_size={}",
+                    symbolName_, address_, domain_, target_, type_, symbolSize_,
+                    expectedSize_);
+    }
 }
 
 MacStateObservation MacClockReader::readState()

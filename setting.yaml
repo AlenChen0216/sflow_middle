@@ -1,5 +1,5 @@
 debug: true # true -> to log the aggregated data to "test_output.json" file. false -> do not log.
-devnum: 0
+devices: [0] # Required non-empty list of unique SmartNIC device numbers.
 runSecs: 0 # 0 for infinite run, > 0 for finite run
 targetIp: "10.10.8.1"
 targetPort: 6343
@@ -22,12 +22,8 @@ startup_timeout_ms: 10000
 startup_poll_interval_us: 100
 calibration_refresh_burst_size: 8
 maximum_sample_uncertainty_ns: 2000000
-calibration_poll_interval_us: 1000
 regression_window_ns: 120000000000
 minimum_regression_span_ns: 5000000000
 maximum_drift_ppm: 1000
 host_step_threshold_ns: 500000
 model_step_threshold_ns: 20000000
-residual_threshold_ns: 1000000
-stale_model_timeout_ms: 10000
-diagnostic_logging_interval_ms: 10000

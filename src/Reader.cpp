@@ -66,7 +66,7 @@ std::vector<flow_data> SmartNicReader::readFlowData() noexcept {
     // 3. Wait until the old bank has no ME contexts using it.
     // 4. Read key/data from the old bank.
     // 5. Clear key/data first, then clear semaphores last.
-
+    std::cout<<"Hello\n";
     if (!cpp_ || slotCount_ == 0) {
         return {};
     }

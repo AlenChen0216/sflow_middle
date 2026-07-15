@@ -116,7 +116,8 @@ public:
 
     TimeAdjuster(nfp_cpp *cpp,
                  const nfp_rtsym *macTimeSymbol,
-                 Config config);
+                 Config config,
+                 std::optional<unsigned int> devnum = std::nullopt);
 
     bool refresh();
     int64_t toUnixNanoseconds(uint32_t sec, uint32_t nsec) const;
