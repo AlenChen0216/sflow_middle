@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <queue>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 

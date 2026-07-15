@@ -1,6 +1,7 @@
 /build
 /src/alen.code-workspace
 /logs
-/docs/*
+/docs
 test_output.json
 nohup.out
+/__pycache__

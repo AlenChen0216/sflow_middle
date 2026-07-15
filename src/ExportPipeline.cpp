@@ -66,6 +66,18 @@ bool ShutdownState::hasFailed() const noexcept
     return failed_.load(std::memory_order_acquire);
 }
 
+bool ShutdownState::waitUntil(std::chrono::steady_clock::time_point deadline)
+{
+    while (!stopRequested()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            return false;  // deadline elapsed normally
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    return true;  // shutdown was requested
+}
 
 SharedQueue::SharedQueue(std::size_t producer_count)
     : active_producers_(producer_count)

@@ -262,12 +262,10 @@ void DeviceRuntime::runWorker(SharedQueue &shared, ShutdownState &shutdown) noex
 
         while (!shutdown.stopRequested())
         {
-            SPDLOG_INFO("[devnum={}] waiting for next tick", devnum_);
             nextTick += kCollectionPeriod;
-            
+            std::this_thread::sleep_until(nextTick);
 
             const auto start = std::chrono::steady_clock::now();
-            SPDLOG_INFO("[devnum={}] starting", devnum_);
             // Flow must be read first: it swaps the shared firmware buffer
             // which the counter reader then consumes for this snapshot.
             const std::vector<flow_data> flowEntries =
