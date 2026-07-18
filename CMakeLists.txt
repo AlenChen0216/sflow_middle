@@ -71,12 +71,14 @@ target_compile_options(nfp_reader_test PRIVATE -Wall -Wextra -fdiagnostics-color
 add_executable(time_calibration_test
 	test/time_calibration_test.cpp
 	src/Time.cpp
+	src/MacClockReader.cpp
+	src/ClockSampler.cpp
 )
 target_include_directories(time_calibration_test PRIVATE
 	include/
 	"${NETRONOME_INCLUDE_DIR}"
 )
-target_link_libraries(time_calibration_test PRIVATE ${NETRONOME_LIBS})
+target_link_libraries(time_calibration_test PRIVATE spdlog::spdlog ${NETRONOME_LIBS})
 set_target_properties(time_calibration_test PROPERTIES
 	BUILD_RPATH "${NETRONOME_ROOT}/lib"
 	INSTALL_RPATH "${NETRONOME_ROOT}/lib"
@@ -85,3 +87,32 @@ target_compile_options(time_calibration_test PRIVATE
 	-Wall -Wextra -fdiagnostics-color=always -O2
 )
 add_test(NAME time_calibration COMMAND time_calibration_test)
+
+add_executable(clock_sampler_test
+	test/clock_sampler_test.cpp
+	src/ClockSampler.cpp
+)
+target_include_directories(clock_sampler_test PRIVATE include/)
+target_compile_options(clock_sampler_test PRIVATE
+	-Wall -Wextra -fdiagnostics-color=always -O2
+)
+add_test(NAME clock_sampler COMMAND clock_sampler_test)
+
+add_executable(raw_clock_probe
+	tools/raw_clock_probe.cpp
+	src/Device.cpp
+	src/MacClockReader.cpp
+	src/ClockSampler.cpp
+)
+target_include_directories(raw_clock_probe PRIVATE
+	include/
+	"${NETRONOME_INCLUDE_DIR}"
+)
+target_link_libraries(raw_clock_probe PRIVATE spdlog::spdlog ${NETRONOME_LIBS})
+set_target_properties(raw_clock_probe PROPERTIES
+	BUILD_RPATH "${NETRONOME_ROOT}/lib"
+	INSTALL_RPATH "${NETRONOME_ROOT}/lib"
+)
+target_compile_options(raw_clock_probe PRIVATE
+	-Wall -Wextra -fdiagnostics-color=always -O2
+)

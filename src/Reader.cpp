@@ -114,7 +114,7 @@ std::vector<flow_data> SmartNicReader::readFlowData() noexcept {
         return {};
     }
     bufferState_ = next_bufferState;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     // Step 3: wait until the old bank is quiescent.
     nfp_cpp_area *proArea = nfp_cpp_area_alloc(cpp_, proCppId, proAddr, sizeof(uint32_t) * 2);
     if (!proArea) {
@@ -134,7 +134,7 @@ std::vector<flow_data> SmartNicReader::readFlowData() noexcept {
         if (proValue == 0) {
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     nfp_cpp_area_release_free(proArea);
 

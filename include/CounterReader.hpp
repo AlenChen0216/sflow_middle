@@ -54,9 +54,12 @@ class CounterReader
 {
 public:
     CounterReader(nfp_cpp *cpp,
-                  uint64_t semAddr0,
-                  uint64_t dataAddr0,
+                  uint64_t staAddr, uint64_t staIsland,
+                  uint64_t proAddr, uint64_t proIsland,
+                  uint64_t semAddr0, uint64_t semAddr1,
+                  uint64_t dataAddr0, uint64_t dataAddr1,
                   uint32_t semIsland0, uint32_t dataIsland0,
+                  uint32_t semIsland1, uint32_t dataIsland1,
                   size_t slotCount);
 
     std::vector<counter_data> readCounterData() noexcept;
@@ -64,11 +67,17 @@ public:
 private:
     nfp_cpp *cpp_;
 
-    uint64_t semAddr_;
-    uint64_t dataAddr_;
+    uint64_t staAddr_;
+    uint64_t proAddr_;
+    uint64_t semAddr_[2];
+    uint64_t dataAddr_[2];
+
+    uint32_t staCppId_;
+    uint32_t proCppId_;
+    uint32_t semCppId_[2];
+    uint32_t dataCppId_[2];
+
     unsigned long semSize_;
     unsigned long dataSize_;
-    uint32_t semCppId_;
-    uint32_t dataCppId_;
     size_t slotCount_;
 };
