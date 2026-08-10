@@ -5,6 +5,11 @@ them to one sFlow destination. It writes logs to the console and to
 `logs/sflow_middle.log`. The active log file is limited to 10 MB; one rotated
 backup is retained as `logs/sflow_middle.log.1`.
 
+## Use guide
+
+1. use "./start.sh 0 1" in sFlow_SmartNIC_offload to run the program in SmartNIC.
+2. use "./start.sh" in sflow_middle to run the collector program.
+
 ## Build
 
 ```bash

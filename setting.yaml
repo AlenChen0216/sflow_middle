@@ -1,7 +1,7 @@
 debug: true # true -> to log the aggregated data to "test_output.json" file. false -> do not log.
-devices: [0] # Required non-empty list of unique SmartNIC device numbers.
+devices: [0,1] # Required non-empty list of unique SmartNIC device numbers.
 runSecs: 0 # 0 for infinite run, > 0 for finite run
-targetIp: "10.10.8.1"
+targetIp: "10.10.10.250"
 targetPort: 6343
 semaphore_sym: "_global_semaphores"
 semaphore_dup_sym: "_global_semaphores_dup"
